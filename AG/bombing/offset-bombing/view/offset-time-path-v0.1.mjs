@@ -1,0 +1,207 @@
+// Offset time path — where an aircraft is T seconds after crossing its IP (user request 2026-10-02:
+// the Top View "Time" dial shows the path flown up to T and the velocity vector at T).
+// Pure world-frame helper (NM, x east, y north) built from a solved Offset result; the Top View
+// draws it. Time zero is the aircraft's own IP, the same reference as the drop-order ΔTime
+// (offset-formation-v0.1 computeDropOrderDelta), so every aircraft of a Flight shares one clock.
+// Legs and their durations are the BE's (result.timing, profile.public):
+//   ingress  IP → Action Point                  timing.ingressSec
+//   turn     Offset turn → Turn End             timing.offsetTurnSec (the flown onset turn samples when the BE
+//            gives geometry.offsetTurnPath, offset-be-v0.2 0.2.11; else the instantaneous arc)
+//   approach Turn End → Roll-in                 timing.approachSec
+//   roll-in  Roll-in trajectory → Track Point   profile.public.rollInTimeSec (samples every 0.1 s)
+//   tracking Track Point → Release              profile.public.trackingTimeSec (a negative value flies 0 s)
+//   bomb     Release → Target                   profile.public.bombTofSec (the bomb; the aircraft stays at Release)
+// A negative leg (an INVALID geometry) is flown in 0 s.
+
+export const OFFSET_TIME_PATH_V0_1 = Object.freeze({
+  id: "offset-time-path-v0.1",
+  // 0.1.1 (2026-10-15, BDP update R2.1): the turn leg follows geometry.offsetTurnPath (onset level turn) with
+  // its own sample times.
+  // 0.1.2 (2026-10-18, owner handoff §3.1): offsetApproachInBdpFrame — the flown path just before the Roll-in Point
+  // (the approach leg, or the onset Offset Turn when the approach is short) in the BDP flight path frame, for the
+  // BDP HUD's Roll-in −3 s start. Bank and G from the BE's turn samples (geometry 0.2.8). Display only.
+  // 0.1.3 (2026-11-01, owner: POP-UP 3D from IP): a POP-UP result (POP-UP Flight 0.1.2: timing.popupHoldDownSec /
+  // popupClimbSec and geometry.points.popPoint) flies its approach leg as the Hold-Down to the Pop Point, then the climb's
+  // ground track to Roll-in Start, in the POP-UP Flight's own times. Offset results are unchanged.
+  // 0.1.4 (2026-11-06, owner: "3D / HUD를 POP-UP처럼 구분, 오프셋 포인트"): offsetApproachInBdpFrame names the leg of each
+  // sample — "ingress" (IP → Offset Point), "turn" (the Offset Turn) or "approach" (after it); it was "approach" for both
+  // straight legs. Positions and times unchanged.
+  version: "0.1.4",
+  phases: Object.freeze(["ingress", "turn", "approach", "roll-in", "tracking", "bomb"]),
+});
+
+const ROLL_SAMPLE_SEC = 0.1;
+
+function finitePoint(point) { return point && Number.isFinite(point.x) && Number.isFinite(point.y); }
+function lerp(a, b, f) { return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f }; }
+function unit(a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const length = Math.hypot(dx, dy);
+  return length > 1e-12 ? { x: dx / length, y: dy / length } : null;
+}
+const nonNegative = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
+
+// Leg from a polyline with a time per vertex (strictly increasing within the leg).
+function polylineLeg(phase, points, times) {
+  return { phase, points, times, durationSec: times[times.length - 1] - times[0] };
+}
+function straightLeg(phase, from, to, durationSec) {
+  return polylineLeg(phase, [from, to], [0, nonNegative(durationSec)]);
+}
+
+function arcPoints(center, start, end, turnDirection, steps = 48) {
+  const radius = Math.hypot(start.x - center.x, start.y - center.y);
+  const startAngle = Math.atan2(start.y - center.y, start.x - center.x);
+  let endAngle = Math.atan2(end.y - center.y, end.x - center.x);
+  // x east / y north: a LEFT turn is counter-clockwise.
+  if (turnDirection === "LEFT") while (endAngle <= startAngle) endAngle += Math.PI * 2;
+  else while (endAngle >= startAngle) endAngle -= Math.PI * 2;
+  return Array.from({ length: steps + 1 }, (_, index) => {
+    const angle = startAngle + ((endAngle - startAngle) * index) / steps;
+    return { x: center.x + radius * Math.cos(angle), y: center.y + radius * Math.sin(angle) };
+  });
+}
+
+export function offsetTimeline(result) {
+  const geometry = result?.geometry;
+  const points = geometry?.points;
+  const timing = result?.timing;
+  const profile = result?.profile?.public;
+  if (!points || !timing || !profile) throw new TypeError("a solved Offset result is required");
+
+  const legs = [];
+  legs.push(straightLeg("ingress", points.ip, points.realActionPoint, timing.ingressSec));
+
+  const turnSec = nonNegative(timing.offsetTurnSec);
+  const turnPath = (geometry.offsetTurnPath ?? []).filter(finitePoint);
+  if (turnPath.length >= 2 && turnSec > 0) {
+    // Onset turn samples carry their own time; the last one is the Turn End at the BE's turn time.
+    const times = turnPath.map((sample, index) => (index === turnPath.length - 1 ? turnSec : Math.min(Math.max(0, sample.tSec), turnSec)));
+    for (let index = 1; index < times.length; index += 1) times[index] = Math.max(times[index], times[index - 1]);
+    legs.push(polylineLeg("turn", turnPath.map(({ x, y }) => ({ x, y })), times));
+  } else if (finitePoint(points.offsetCenter) && turnSec > 0) {
+    const arc = arcPoints(points.offsetCenter, points.realActionPoint, points.turnEnd, geometry.direction?.offsetDirection);
+    legs.push(polylineLeg("turn", arc, arc.map((_, index) => (turnSec * index) / (arc.length - 1))));
+  } else {
+    legs.push(straightLeg("turn", points.realActionPoint, points.turnEnd, 0));
+  }
+
+  const holdDownSec = timing.popupHoldDownSec;
+  const climbSec = timing.popupClimbSec;
+  if (finitePoint(points.popPoint) && Number.isFinite(holdDownSec) && Number.isFinite(climbSec)) {
+    legs.push(polylineLeg("approach", [points.turnEnd, points.popPoint, points.rollStart], [0, nonNegative(holdDownSec), nonNegative(holdDownSec) + nonNegative(climbSec)]));
+  } else {
+    legs.push(straightLeg("approach", points.turnEnd, points.rollStart, timing.approachSec));
+  }
+
+  const rollSec = nonNegative(profile.rollInTimeSec);
+  const samples = (geometry.rollInTrajectorySamples ?? []).filter(finitePoint);
+  if (samples.length >= 2 && rollSec > 0) {
+    // Samples are taken every 0.1 s of the roll-in; the last one is the roll-out (Track Point).
+    const times = samples.map((_, index) => (index === samples.length - 1 ? rollSec : Math.min(index * ROLL_SAMPLE_SEC, rollSec)));
+    for (let index = 1; index < times.length; index += 1) times[index] = Math.max(times[index], times[index - 1]);
+    legs.push(polylineLeg("roll-in", samples, times));
+  } else {
+    legs.push(straightLeg("roll-in", points.rollStart, points.trackPoint, rollSec));
+  }
+
+  const trackSec = nonNegative(profile.trackingTimeSec);
+  const attack = unit(points.trackPoint, points.target);
+  const travelNm = trackSec > 0 ? nonNegative(profile.downRangeTravelNm) : 0;
+  const release = attack ? { x: points.trackPoint.x + attack.x * travelNm, y: points.trackPoint.y + attack.y * travelNm } : points.trackPoint;
+  legs.push(straightLeg("tracking", points.trackPoint, release, trackSec));
+  legs.push(straightLeg("bomb", release, points.target, profile.bombTofSec));
+
+  let clock = 0;
+  for (const leg of legs) {
+    leg.startSec = clock;
+    clock += leg.durationSec;
+    leg.endSec = clock;
+  }
+  const bombLeg = legs[legs.length - 1];
+  return {
+    legs,
+    release,
+    releaseSec: bombLeg.startSec,
+    impactSec: bombLeg.endSec,
+    // Aircraft (and, after Release, bomb) state at T seconds after IP. T is clamped to [0, Impact].
+    at(timeSec) {
+      const t = Math.min(Math.max(Number(timeSec) || 0, 0), bombLeg.endSec);
+      const flown = [];
+      let aircraft = null;
+      let heading = null;
+      let phase = "ingress";
+      for (const leg of legs) {
+        if (leg.phase === "bomb") break;
+        const local = t - leg.startSec;
+        if (local < 0) break;
+        phase = leg.phase;
+        const { points: path, times } = leg;
+        let index = 1;
+        while (index < times.length - 1 && times[index] < local) index += 1;
+        // Vertices already passed, then the interpolated current point.
+        for (let i = 0; i < index; i += 1) if (times[i] <= local) flown.push(path[i]);
+        const span = times[index] - times[index - 1];
+        const fraction = span > 0 ? Math.min(1, Math.max(0, (local - times[index - 1]) / span)) : 1;
+        aircraft = lerp(path[index - 1], path[index], fraction);
+        flown.push(aircraft);
+        heading = unit(path[index - 1], path[index]) ?? heading;
+        if (local < leg.durationSec) break;
+      }
+      const released = t >= bombLeg.startSec && bombLeg.durationSec >= 0;
+      const bomb = released
+        ? lerp(release, points.target, bombLeg.durationSec > 0 ? (t - bombLeg.startSec) / bombLeg.durationSec : 1)
+        : null;
+      return { timeSec: t, phase: released ? "released" : phase, aircraft, heading, flown, bomb };
+    },
+  };
+}
+
+// The `seconds` before this aircraft's Roll-in Point, every 0.1 s (not before its IP), in the BDP flight path frame:
+// ft from the Roll-in Point, y along the Initial (Approaching) heading, x to its right; heading relative to it
+// (right +), bank right wing down +, G; level at the Roll-in altitude (BDP flight path v0.1.1 `approach`).
+const FT_PER_NM = 6076.11549;
+export function offsetApproachInBdpFrame(result, seconds = 3.5) {
+  const timeline = offsetTimeline(result);
+  const rollLeg = timeline.legs.find((leg) => leg.phase === "roll-in");
+  const turnLeg = timeline.legs.find((leg) => leg.phase === "turn");
+  const geometry = result.geometry;
+  const start = geometry.points.rollStart;
+  if (!rollLeg || !finitePoint(start) || !Number.isFinite(geometry.offsetHeadingDeg)) return null;
+  const h = (geometry.offsetHeadingDeg * Math.PI) / 180;
+  const fwd = { x: Math.sin(h), y: Math.cos(h) };
+  const right = { x: Math.cos(h), y: -Math.sin(h) };
+  const turnPath = geometry.offsetTurnPath ?? [];
+  const turnSign = geometry.direction?.offsetDirection === "LEFT" ? -1 : 1;
+  const turnState = (localSec) => {
+    if (turnPath.length < 2) return { bankDeg: 0, loadFactor: 1 };
+    let i = 1;
+    while (i < turnPath.length - 1 && turnPath[i].tSec < localSec) i += 1;
+    const a = turnPath[i - 1];
+    const b = turnPath[i];
+    const k = b.tSec > a.tSec ? Math.min(1, Math.max(0, (localSec - a.tSec) / (b.tSec - a.tSec))) : 1;
+    const mix = (key, fallback) => (Number.isFinite(a[key]) && Number.isFinite(b[key]) ? a[key] + (b[key] - a[key]) * k : fallback);
+    return { bankDeg: turnSign * mix("bankDeg", 0), loadFactor: mix("loadFactorG", 1) };
+  };
+  const samples = [];
+  const first = Math.max(0, rollLeg.startSec - seconds);
+  for (let k = 0; first + k * ROLL_SAMPLE_SEC < rollLeg.startSec - 1e-6; k += 1) {
+    const tSec = first + k * ROLL_SAMPLE_SEC;
+    const at = timeline.at(tSec);
+    if (!at.aircraft || !at.heading) continue;
+    const rel = { x: at.aircraft.x - start.x, y: at.aircraft.y - start.y };
+    let headingDeg = (Math.atan2(at.heading.x, at.heading.y) * 180) / Math.PI - geometry.offsetHeadingDeg;
+    headingDeg -= 360 * Math.round(headingDeg / 360);
+    const turning = at.phase === "turn" && turnLeg;
+    samples.push({
+      t: tSec - rollLeg.startSec,
+      x: (rel.x * right.x + rel.y * right.y) * FT_PER_NM,
+      y: (rel.x * fwd.x + rel.y * fwd.y) * FT_PER_NM,
+      headingDeg,
+      ...(turning ? turnState(tSec - turnLeg.startSec) : { bankDeg: 0, loadFactor: 1 }),
+      phase: turning ? "turn" : at.phase === "ingress" ? "ingress" : "approach",
+    });
+  }
+  return samples;
+}

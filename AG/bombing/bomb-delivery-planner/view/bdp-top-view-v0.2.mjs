@@ -1,0 +1,542 @@
+import {
+  appendAlignedDimension,
+  appendAngleArc,
+  appendDirectedLine,
+  applyTextHalo,
+  clamp,
+  createOpenArrowMarker,
+  scopeSvgMarkerIds,
+  SVG_DIAGRAM_COLORS_V0_1,
+  SVG_DIAGRAM_STYLE_V0_1,
+  svgNode,
+} from "../../../../common/diagram/svg-primitives-v0.1.mjs?v=0.1.5";
+import { createSmartLabelLayout } from "../../../../common/diagram/svg-smart-label-v0.1.mjs?v=0.1.4";
+import { createSvgAutoCanvas } from "../../../../common/diagram/svg-viewport-v0.1.mjs?v=0.1.4";
+import { formatDeg, formatFt, formatG, formatKt, formatMach, formatNm } from "../../../../common/ui/display-precision-v0.1.mjs";
+import { BDP_TOP_VIEW_LEGEND, BDP_VIEW_COLORS as C, bdpOffsetTextBase, bdpTopViewTitle, rollInAngleRangeText } from "./bdp-view-style-v0.1.mjs?v=0.1.2";
+
+// Roll-in Top View — BDP-owned view in the V2 unified view grammar (common/diagram/SPEC.md;
+// BDP FE SPEC "Roll-in Top View rules — 2026-09-28").
+// - Initial (the BDP entry, OA1 in the current BDP) is at the bottom and the Target straight up:
+//   every point turns about OA1 so the OA1 → Target bearing points up.
+// - Roll-in Range is dimensioned along that (vertical) OA1 → Target line, so it is the true range.
+// - Self-contained: fills an empty <svg>, sets every stroke, fill and text halo as attributes.
+// - Labels sit on their element or are joined to it by a leader line (Common smart labels).
+// 0.2.1 (2026-09-29, user decision for Offset): option `orientation: "NORTH_UP"` draws the same view on
+// a north-up map (south at the bottom, north arrow). The host passes the true heading of the
+// Initial → OA1 leg (`inHeadingDeg`; Offset: Approaching Heading) and the Roll-in turn direction
+// (`rollDirection`), which place the BDP frame on the map. The default stays Initial bottom, Target up
+// (BDP FE).
+// 0.2.2 (2026-09-29, user requests): Roll-in Lead Angle is drawn as the angle it is — an arc at the
+// Target between the OA1 → Target line and the MAP run (Attack Heading); a Remark block gives the
+// Roll-in Point → Target Roll-in Range and Roll-in Bearing; `context: "PATTERN"` (a pattern host such
+// as Offset, not the BDP FE) adds Roll-in Altitude to the Remark and drops the altitude from the
+// Initial label.
+// 0.2.3 (2026-10-03, user; Offset and BDP FE first, every host later): option
+// `rollInRangeStyle: "radial"` drops the dashed Roll-in Range dimension and names the red
+// Target (Ground Range circle centre) → Roll-in Point line "Roll-in Range" instead; the Roll-in label
+// gets "NN°/N.NNM" (Roll-in Angle Off / Roll-in Range). Default "dimension" keeps the former drawing
+// (BOX / Wheel for now).
+
+export const BDP_TOP_VIEW_V0_2 = Object.freeze({
+  id: "bdp-top-view-v0.2",
+  // 0.2.4 (2026-10-06, user, Offset): host options `title` (replaces the "Roll-in #n Top View"
+  // title), `lateralDistance: false` (no Roll-in Lat. D dimension, label or returned value) and
+  // `referenceLine: "ANGLE_OFF_90"` (the dashed Initial-track reference line only at Angle Off 90°).
+  // Without them the view is unchanged.
+  // 0.2.5 (2026-10-06, user, Offset): `remarkDetail: true` adds Attack Heading (the host's
+  // `attackHeadingDeg`, else the Track Point → Target bearing on a north-up map), Dive Angle, Roll-in
+  // Bank Angle, Roll-in G and AOD to the Remark; `oneLineLabels: true` draws MAP as "MAP: 2.0 NM".
+  // 0.2.6 (2026-10-07, user, Offset): `layout: "OFFSET"` — text at twice the old size at 100%, the
+  // Angle-Off label at the common label size, a "Roll-in Radius: x NM" label on the Roll-in turn, the
+  // Roll-in Range line's arrow at the Target, and the Remark rows returned as `legend` items for the
+  // host's legend box under the drawing (Offset Top View legend format) instead of the top-right block.
+  // 0.2.7 (2026-10-07, user, Offset): the Roll-in Radius label is hidden again (no Roll-in Radius on
+  // the BDP Top View).
+  // 0.2.8 (2026-10-07, user, Offset): `advanced` (host toggle). Offset layout: the Roll-in Range line
+  // label carries its value; the legend shows Roll-in Angle Off instead of Roll-in Bearing in two
+  // columns (`legendColumns: 2`); Advanced brings back Roll-in Bearing (legend) and the Roll-in Radius
+  // label. Roll-in Lat. D stays hidden for a host that passes lateralDistance: false, Advanced or not.
+  // 0.2.9 (2026-10-15, owner R6, Offset): NORTH_UP takes `upHeadingDeg` (default 0): the map turns so that
+  // true heading points up (Offset: the Run-In heading, "Run-in up"); the north arrow turns with it and
+  // every heading shown stays true.
+  // 0.2.10 (2026-10-18, owner handoff §5, Offset): the turned north arrow is placed and reserved by its
+  // rotated extent (at 90° / 270° it no longer leaves the canvas or sits under labels). The host's
+  // `upHeadingDeg` chooses the map's up: Offset passes the Initial heading (Initial Up) or 0 (North Up).
+  // 0.2.11 (2026-10-18, owner, Offset layout): the text base follows the host's `viewportWidth` — 2× on a phone
+  // (≤ 620 px or none given, unchanged), 1.2× on a PC (the former 60% is the new 100%; bdpOffsetTextBase).
+  version: "0.2.11",
+  subject: "Roll-in",
+  view: "Top View",
+  orientation: "INITIAL_BOTTOM_TARGET_UP",
+  orientations: Object.freeze(["INITIAL_BOTTOM_TARGET_UP", "NORTH_UP"]),
+  canvas: Object.freeze({ width: 900, minHeight: 620, maxHeight: 1300 }),
+  legend: BDP_TOP_VIEW_LEGEND,
+});
+
+export { bdpTopViewTitle };
+
+const BDP_TOP_LEGEND_COLORS = Object.freeze({
+  "Roll-in Range": C.rollInTarget,
+  "Roll-in Bearing": C.rollInTarget,
+  "Roll-in Angle Off": C.rollInTarget,
+  "Roll-in Altitude": C.rollIn,
+  "Attack Heading": C.map,
+  "Dive Angle": C.initialTrack,
+  "Roll-in Bank Angle": C.rollIn,
+  "Roll-in G": C.rollIn,
+  "AOD": C.aimOff,
+});
+
+const WIDTH = BDP_TOP_VIEW_V0_2.canvas.width;
+const DIMENSION_LANE_PX = 175;
+
+export function applyBdpTopViewZoom(svg, zoom = 1) {
+  const normalized = clamp(Number(zoom) || 1, 0.5, 2);
+  const height = Number(svg.dataset?.canvasHeight) || 700;
+  const w = WIDTH / normalized;
+  const h = height / normalized;
+  svg.setAttribute("viewBox", `${WIDTH / 2 - w / 2} ${height / 2 - h / 2} ${w} ${h}`);
+  return normalized;
+}
+
+function rotateAbout(origin, angleRad) {
+  const cos = Math.cos(angleRad);
+  const sin = Math.sin(angleRad);
+  return (point) => {
+    const dx = point.x - origin.x;
+    const dy = point.y - origin.y;
+    return { x: origin.x + dx * cos - dy * sin, y: origin.y + dx * sin + dy * cos };
+  };
+}
+
+// North-up placement of the BDP frame: forward (+x) runs along the Initial → OA1 true heading, the turn
+// side (+y) 90° to the Roll-in side of it. World result: x = east, y = north (NM), about OA1.
+function northUpAbout(origin, inHeadingDeg, rollDirection) {
+  const h = (inHeadingDeg * Math.PI) / 180;
+  const turn = rollDirection === "RIGHT" ? 1 : -1;
+  const forward = { x: Math.sin(h), y: Math.cos(h) };
+  const side = { x: turn * Math.cos(h), y: -turn * Math.sin(h) };
+  return (point) => {
+    const f = point.x - origin.x;
+    const t = point.y - origin.y;
+    return { x: origin.x + f * forward.x + t * side.x, y: origin.y + f * forward.y + t * side.y };
+  };
+}
+
+// Three-digit true heading with the degree sign (Offset SPEC "Canonical heading").
+const headingText = (deg) => `${String(((Math.round(deg) % 360) + 360) % 360).padStart(3, "0")}°`;
+
+const station = (value) => (value ? { x: value.forwardNm, y: value.turnSideNm } : null);
+const unit = (from, to) => {
+  const length = Math.hypot(to.x - from.x, to.y - from.y) || 1;
+  return { x: (to.x - from.x) / length, y: (to.y - from.y) / length };
+};
+
+// Label candidates placed on a line: beside its middle first (no leader), then farther out.
+function lineCandidates(from, to, side = 1) {
+  const d = unit(from, to);
+  const n = { x: -d.y * side, y: d.x * side };
+  const anchorFor = (dx) => (dx > 6 ? "start" : dx < -6 ? "end" : "middle");
+  return [16, 44, 80, -16, -44].map((distance) => {
+    const dx = n.x * distance;
+    const dy = n.y * distance + 5;
+    return { dx, dy, anchor: anchorFor(dx) };
+  });
+}
+
+export function renderBdpTopView(svg, result, options = {}) {
+  if (!(svg instanceof SVGElement)) throw new TypeError("svg must be an SVGElement");
+  const semantic = result?.visualization?.semanticState;
+  if (!semantic?.stations || !semantic?.paths) throw new TypeError("BDP semantic visualization state is required");
+  const pub = result.public;
+  const input = result.canonicalInputs;
+  const offsetLayout = options.layout === "OFFSET";
+  const advanced = options.advanced === true;
+  const textBase = offsetLayout ? bdpOffsetTextBase(options.viewportWidth) : 1;
+  const textScale = clamp(Number(options.textScale) || 1, 0.5, 2) * textBase;
+  svg.dataset.textBaseScale = String(textBase);
+
+  // World frame (NM): x = pre-roll-in forward, y = turn side (drawn up before rotation).
+  const s = semantic.stations;
+  const oa1 = station(s.rollInStart);
+  const track = station(s.trackPoint);
+  const target = station(s.target);
+  const aimOffWorld = station(s.aimOffPoint);
+  const groundRangeNm = pub.groundRangeNm;
+  const ingressLengthNm = Math.max(groundRangeNm, 0.8);
+
+  // Default: Initial at the bottom, Target straight up (OA1 → Target bearing turned to +Y, screen up).
+  // NORTH_UP: the BDP frame placed on a north-up map by the Initial → OA1 heading and the turn side.
+  const northUp = options.orientation === "NORTH_UP";
+  if (northUp && (!Number.isFinite(Number(options.inHeadingDeg)) || !["LEFT", "RIGHT"].includes(options.rollDirection))) {
+    throw new TypeError("NORTH_UP needs a finite inHeadingDeg and rollDirection LEFT or RIGHT");
+  }
+  const bearing = Math.atan2(target.y - oa1.y, target.x - oa1.x);
+  const rotationRad = Math.PI / 2 - bearing;
+  const upDeg = northUp && Number.isFinite(Number(options.upHeadingDeg)) ? Number(options.upHeadingDeg) : 0;
+  const rotate = northUp ? northUpAbout(oa1, Number(options.inHeadingDeg) - upDeg, options.rollDirection) : rotateAbout(oa1, rotationRad);
+  const w = {
+    oa1,
+    track: rotate(track),
+    target: rotate(target),
+    aimOff: aimOffWorld ? rotate(aimOffWorld) : null,
+    ingress: rotate({ x: oa1.x - ingressLengthNm, y: oa1.y }),
+    rollPath: semantic.paths.rollIn.map((p) => rotate({ x: p.forwardNm, y: p.turnSideNm })),
+  };
+  // Roll-in Radius (owner 2026-11-10): the tightest point of the Roll-in, where its real turn radius is.
+  const turnRadiusPoint = result.visualization?.rollInTurnRadius?.point;
+  w.rollTurnPoint = turnRadiusPoint ? rotate({ x: turnRadiusPoint.forwardNm, y: turnRadiusPoint.turnSideNm }) : null;
+  // Roll-in Long. D / Lat. D: OA1-frame components of OA1 → Track Point. Lat. D is measured from the
+  // Initial track extended through OA1 (to its foot at Long. D) across to Track Point.
+  const longitudinalNm = track.x - oa1.x;
+  const lateralNm = track.y - oa1.y;
+  w.lateralFoot = rotate({ x: oa1.x + longitudinalNm, y: oa1.y });
+  w.initialExtension = rotate({ x: oa1.x + Math.max(longitudinalNm, 0) + 0.25 * groundRangeNm, y: oa1.y });
+
+  // Remark: the Roll-in Point (OA1) → Target Roll-in Range and Roll-in Bearing. On a north-up map the
+  // bearing is true; the BDP FE has no true reference, so it is the angle off the Initial heading
+  // (the default view draws the Roll-in turn side to the left). A pattern host adds Roll-in Altitude.
+  const patternHost = options.context === "PATTERN";
+  const offInitialDeg = (Math.atan2(target.y - oa1.y, target.x - oa1.x) * 180) / Math.PI;
+  const rollInBearingText = northUp
+    ? headingText((Math.atan2(w.target.x - w.oa1.x, w.target.y - w.oa1.y) * 180) / Math.PI + upDeg)
+    : `${formatDeg(Math.abs(offInitialDeg))}° ${offInitialDeg >= 0 ? "L" : "R"} of Initial heading`;
+  const remarkRows = [
+    ["Roll-in Range", `${formatNm(pub.rollInRangeNm)} NM`],
+    // Offset layout (2026-10-07, user): Roll-in Angle Off in place of Roll-in Bearing; Advanced shows both.
+    ...(offsetLayout ? [["Roll-in Angle Off", `${formatDeg(pub.rollInAngleOffDeg)}°`]] : []),
+    ...(!offsetLayout || advanced ? [["Roll-in Bearing", rollInBearingText]] : []),
+    ...(patternHost ? [["Roll-in Altitude", `${formatFt(pub.resolvedInitialAltitudeMslFt)} ft MSL`]] : []),
+  ];
+  if (options.remarkDetail === true) {
+    const attackDeg = Number.isFinite(Number(options.attackHeadingDeg))
+      ? Number(options.attackHeadingDeg)
+      : northUp ? (Math.atan2(w.target.x - w.track.x, w.target.y - w.track.y) * 180) / Math.PI + upDeg : null;
+    if (attackDeg !== null) remarkRows.push(["Attack Heading", headingText(attackDeg)]);
+    remarkRows.push(
+      ["Dive Angle", `${formatDeg(input.diveAngleDeg)}°`],
+      // BDP v0.4 (Offset, 2026-10-15) solves the bank (public result); v0.3 takes it as an input.
+      ["Roll-in Bank Angle", `${formatDeg(pub.rollInBankAngleDeg ?? input.rollInBankAngleDeg)}°`],
+      ["Roll-in G", `${formatG(input.rollInG)} G`],
+      ["AOD", result.local?.aimOffDistanceFt != null && Number.isFinite(Number(result.local.aimOffDistanceFt)) ? `${formatFt(result.local.aimOffDistanceFt)} ft` : "-"],
+    );
+  }
+  const remarkSize = SVG_DIAGRAM_STYLE_V0_1.font.detailPx * textScale;
+  const remarkLineHeight = remarkSize * 1.45;
+  const remarkHeight = 22 + (remarkRows.length + 1) * remarkLineHeight;
+
+  // The Roll-in Range dimension goes on the side away from the Initial track. On a north-up map the
+  // OA1 → Target line runs in any direction, so both sides keep room for it.
+  let side = w.ingress.x <= w.oa1.x ? 1 : -1;
+  const radialRange = options.rollInRangeStyle === "radial";
+  // Radial style: no dimension lane is needed.
+  const northUpSide = radialRange ? 85 : DIMENSION_LANE_PX - 25;
+  const margins = northUp
+    ? { top: 110, bottom: 110, left: northUpSide, right: northUpSide }
+    : { top: 64, bottom: 92, left: 56, right: 56 };
+  if (!northUp && !radialRange) {
+    if (side > 0) margins.right = DIMENSION_LANE_PX; else margins.left = DIMENSION_LANE_PX;
+  }
+  // The Remark block sits in the top-right corner above the drawing.
+  if (!offsetLayout) margins.top = Math.max(margins.top, remarkHeight + 18);
+  const fitPoints = [w.ingress, w.oa1, w.track, w.target, w.aimOff, w.initialExtension, ...w.rollPath,
+    { x: w.target.x - groundRangeNm, y: w.target.y - groundRangeNm },
+    { x: w.target.x + groundRangeNm, y: w.target.y + groundRangeNm }].filter(Boolean);
+  if (northUp && !radialRange) {
+    // The Roll-in Range dimension runs parallel to OA1 → Target, one Ground Range out on either side.
+    const along = unit(w.oa1, w.target);
+    const normal = { x: -along.y * groundRangeNm, y: along.x * groundRangeNm };
+    for (const end of [w.oa1, w.target]) for (const sign of [1, -1]) fitPoints.push({ x: end.x + sign * normal.x, y: end.y + sign * normal.y });
+  }
+  const fit = createSvgAutoCanvas(fitPoints, {
+    width: WIDTH,
+    minHeight: BDP_TOP_VIEW_V0_2.canvas.minHeight,
+    maxHeight: BDP_TOP_VIEW_V0_2.canvas.maxHeight,
+    margins,
+    minSpan: 0.3,
+    flipY: true,
+  });
+  const HEIGHT = fit.height;
+  const px = (point) => (point ? fit.project(point) : null);
+  const P = {
+    oa1: px(w.oa1), track: px(w.track), target: px(w.target), aimOff: px(w.aimOff),
+    ingress: px(w.ingress), lateralFoot: px(w.lateralFoot), initialExtension: px(w.initialExtension), rollPath: w.rollPath.map(px), rollTurnPoint: px(w.rollTurnPoint),
+  };
+  const radiusPx = groundRangeNm * fit.scale;
+  if (northUp) {
+    // Screen normal (−dy, dx) of OA1 → Target, the dimension's offset direction: away from the ingress.
+    const normal = { x: -(P.target.y - P.oa1.y), y: P.target.x - P.oa1.x };
+    side = normal.x * (P.ingress.x - P.oa1.x) + normal.y * (P.ingress.y - P.oa1.y) > 0 ? -1 : 1;
+  }
+
+  // Self-contained canvas.
+  svg.replaceChildren();
+  svg.dataset.canvasHeight = String(HEIGHT);
+  svg.style.aspectRatio = `${WIDTH} / ${HEIGHT}`;
+  const title = options.title || bdpTopViewTitle({ aircraftNumber: options.aircraftNumber });
+  svg.setAttribute("aria-label", title);
+  const defs = svgNode("defs");
+  [["initial", C.initialTrack], ["roll", C.rollIn], ["map", C.map], ["red", C.rollInTarget], ["aim", C.aimOff]]
+    .forEach(([name, color]) => defs.append(createOpenArrowMarker(`bdp-top-${name}`, color)));
+  defs.append(createOpenArrowMarker("bdp-top-leader", SVG_DIAGRAM_COLORS_V0_1.helper, SVG_DIAGRAM_STYLE_V0_1.arrow.leader));
+  const root = svgNode("g", { "data-view": BDP_TOP_VIEW_V0_2.id });
+  svg.append(defs, root);
+  root.append(svgNode("rect", { x: 0, y: 0, width: WIDTH, height: HEIGHT, fill: SVG_DIAGRAM_COLORS_V0_1.background }));
+
+  // Target-centred Ground Range circle through Track Point.
+  root.append(svgNode("circle", {
+    cx: P.target.x, cy: P.target.y, r: radiusPx,
+    fill: C.groundRangeFill, "fill-opacity": 0.68, stroke: C.frame, "stroke-width": 2.5,
+  }));
+
+  appendDirectedLine(root, P.ingress, P.oa1, { color: C.initialTrack, width: 3.5, markerEndId: "bdp-top-initial", toGap: 15 });
+  // Initial track extended through OA1: the reference line of Roll-in Long. D / Lat. D. A host may
+  // keep it only at Angle Off 90° (referenceLine "ANGLE_OFF_90").
+  const referenceLineVisible = options.referenceLine !== "ANGLE_OFF_90" || Math.abs(Number(input.angleOffDeg) - 90) < 1e-9;
+  if (referenceLineVisible) root.append(svgNode("line", {
+    x1: P.oa1.x, y1: P.oa1.y, x2: P.initialExtension.x, y2: P.initialExtension.y,
+    stroke: C.initialTrack, "stroke-width": 1.3, "stroke-dasharray": "6 5", opacity: 0.75, "data-top-view-role": "initial-extension",
+  }));
+  // Offset layout: the arrow points at the Target (Roll-in Point → Target).
+  if (offsetLayout) appendDirectedLine(root, P.oa1, P.target, { color: C.rollInTarget, width: 3.2, markerEndId: "bdp-top-red", fromGap: 15, toGap: 12 });
+  else appendDirectedLine(root, P.target, P.oa1, { color: C.rollInTarget, width: 3.2, markerEndId: "bdp-top-red", fromGap: 12, toGap: 15 });
+  appendDirectedLine(root, P.track, P.target, { color: C.map, width: 3.6, markerEndId: "bdp-top-map", fromGap: 8, toGap: 12 });
+  const aimOffVisible = P.aimOff && Math.hypot(P.aimOff.x - P.target.x, P.aimOff.y - P.target.y) > 12;
+  if (aimOffVisible) appendDirectedLine(root, P.target, P.aimOff, { color: C.aimOff, width: 2.6, markerEndId: "bdp-top-aim", fromGap: 10, toGap: 9 });
+  root.append(svgNode("path", {
+    d: P.rollPath.map((p, index) => `${index ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" "),
+    fill: "none", stroke: C.rollIn, "stroke-width": 4.5, "stroke-linecap": "round", "stroke-linejoin": "round",
+    "marker-end": "url(#bdp-top-roll)",
+  }));
+
+  // Dimensions: true Roll-in Range along OA1 → Target; Roll-in Lat. D along the OA1 turn-side axis.
+  const rangeOffset = side * ((northUp ? radiusPx : Math.max(radiusPx, Math.abs(P.oa1.x - P.target.x))) + 38);
+  if (!radialRange) appendAlignedDimension(root, {
+    // Default: OA1 → Target points up on screen, so the dimension's left normal is +x (right). North-up:
+    // `side` was taken from the screen normal above.
+    from: P.oa1, to: P.target, offset: rangeOffset, color: C.initialTrack, markerId: "bdp-top-initial",
+    title: "Roll-in Range", detail: `${formatNm(pub.rollInRangeNm)} NM`,
+    titleSize: SVG_DIAGRAM_STYLE_V0_1.font.dimensionTitlePx * textScale, detailSize: SVG_DIAGRAM_STYLE_V0_1.font.detailPx * textScale,
+  });
+  // Lat. D: from the Initial track extension (at Long. D) across to Track Point, drawn just forward of
+  // Track Point so its extension lines run along the Initial track.
+  const forward = unit(P.oa1, P.initialExtension);
+  const lateral = unit(P.lateralFoot, P.track);
+  const lateralSign = (-lateral.y) * forward.x + lateral.x * forward.y >= 0 ? 1 : -1;
+  // Too short to read (e.g. a small Angle-Off): the value stays in Roll-in Information.
+  // A host may hide it altogether (lateralDistance: false).
+  const lateralShown = options.lateralDistance !== false;
+  const lateralVisible = lateralShown && Math.hypot(P.track.x - P.lateralFoot.x, P.track.y - P.lateralFoot.y) >= 24;
+  // Its label goes through the smart layout below (it sits among the Roll-in stations).
+  const lateralDimension = lateralVisible
+    ? appendAlignedDimension(root, { from: P.lateralFoot, to: P.track, offset: lateralSign * 30, color: C.initialTrack, markerId: "bdp-top-initial" })
+    : null;
+
+  // Stations.
+  root.append(svgNode("circle", { cx: P.oa1.x, cy: P.oa1.y, r: 7, fill: "#ffffff", stroke: C.rollIn, "stroke-width": 3, "data-bdp-station": "oa1" }));
+  root.append(svgNode("circle", { cx: P.track.x, cy: P.track.y, r: 4.5, fill: "#ffffff", stroke: C.rollIn, "stroke-width": 2, "data-bdp-station": "track-point" }));
+  if (aimOffVisible) root.append(svgNode("circle", { cx: P.aimOff.x, cy: P.aimOff.y, r: 5, fill: "#ffffff", stroke: C.aimOff, "stroke-width": 2 }));
+  root.append(svgNode("circle", { cx: P.target.x, cy: P.target.y, r: 6, fill: C.target, stroke: "#ffffff", "stroke-width": 2, "data-bdp-station": "target" }));
+  root.append(svgNode("line", { x1: P.target.x - 10, y1: P.target.y, x2: P.target.x + 10, y2: P.target.y, stroke: C.target, "stroke-width": 2 }));
+  root.append(svgNode("line", { x1: P.target.x, y1: P.target.y - 10, x2: P.target.x, y2: P.target.y + 10, stroke: C.target, "stroke-width": 2 }));
+
+  // Roll-in Lead Angle: the angle at the Target between the OA1 → Target line and the Track Point →
+  // Target run (Attack Heading).
+  const toOa1 = Math.atan2(P.oa1.y - P.target.y, P.oa1.x - P.target.x);
+  const toTrack = Math.atan2(P.track.y - P.target.y, P.track.x - P.target.x);
+  let leadSweep = toTrack - toOa1;
+  while (leadSweep > Math.PI) leadSweep -= 2 * Math.PI;
+  while (leadSweep <= -Math.PI) leadSweep += 2 * Math.PI;
+  const leadRadius = Math.max(18, Math.min(64, 0.45 * Math.hypot(P.track.x - P.target.x, P.track.y - P.target.y), 0.45 * Math.hypot(P.oa1.x - P.target.x, P.oa1.y - P.target.y)));
+  const leadArcVisible = Math.abs(leadSweep) > 0.004;
+  if (leadArcVisible) {
+    appendAngleArc(root, P.target, leadRadius, toOa1, toOa1 + leadSweep, { color: C.rollInTarget, width: 1.8 });
+    root.lastElementChild.setAttribute("data-top-view-role", "lead-angle-arc");
+  }
+  const leadMid = toOa1 + leadSweep / 2;
+  const leadAnchorPoint = { x: P.target.x + Math.cos(leadMid) * leadRadius, y: P.target.y + Math.sin(leadMid) * leadRadius };
+
+  // Remark block (top right).
+  const remarkRight = WIDTH - 22;
+  const remark = svgNode("g", { "data-top-view-role": "remark" });
+  remark.append(svgNode("text", {
+    x: remarkRight, y: 22 + remarkLineHeight * 0.8, "text-anchor": "end", "font-size": remarkSize, "font-weight": 850, fill: SVG_DIAGRAM_COLORS_V0_1.muted,
+  }, "Remark · Roll-in Point → Target"));
+  remarkRows.forEach(([name, value], index) => remark.append(svgNode("text", {
+    x: remarkRight, y: 22 + remarkLineHeight * (index + 1.8), "text-anchor": "end", "font-size": remarkSize, "font-weight": 750, fill: C.frame,
+    "data-remark-key": name,
+  }, `${name}: ${value}`)));
+  if (!offsetLayout) root.append(remark);
+  const remarkWidth = Math.max(...["Remark · Roll-in Point → Target", ...remarkRows.map(([name, value]) => `${name}: ${value}`)].map((text) => text.length)) * remarkSize * 0.6;
+  const remarkRect = { x: remarkRight - remarkWidth, y: 14, w: remarkWidth + 8, h: remarkHeight };
+
+  // North-up map: north arrow at the top left (the Offset Top View's north arrow).
+  let northArrowRect = null;
+  if (northUp) {
+    const size = SVG_DIAGRAM_STYLE_V0_1.font.lineTitlePx * textScale * 1.4;
+    const head = size * 0.45;
+    // The arrow turns about its centre: keep its whole turning circle on the canvas (0.2.10).
+    const half = (size * 3 + 8) / 2 + head;
+    const left = Math.max(36, half + 6);
+    const top = Math.max(18, upDeg ? half - (size * 3 + 8) / 2 + 6 : 18);
+    const tipY = top + size + 8;
+    const tailY = tipY + size * 2;
+    // Turned with the map (upHeadingDeg): it points to true north.
+    const northArrow = svgNode("g", { "data-top-view-role": "north-arrow", ...(upDeg ? { transform: `rotate(${-upDeg} ${left} ${(top + tailY) / 2})` } : {}) });
+    northArrow.append(svgNode("text", { x: left, y: top + size * 0.85, "text-anchor": "middle", "font-size": size, "font-weight": 900, fill: "#243240" }, "N"));
+    northArrow.append(svgNode("line", { x1: left, y1: tailY, x2: left, y2: tipY + head, stroke: "#243240", "stroke-width": 3, "stroke-linecap": "round" }));
+    northArrow.append(svgNode("polygon", { points: `${left},${tipY} ${left - head * 0.7},${tipY + head * 1.2} ${left + head * 0.7},${tipY + head * 1.2}`, fill: "#243240" }));
+    root.append(northArrow);
+    const cy = (top + tailY) / 2;
+    northArrowRect = upDeg ? { x: left - half, y: cy - half, w: half * 2, h: half * 2 } : { x: left - size, y: top, w: size * 2, h: tailY - top + 6 };
+  }
+
+  // Labels: on their element, or joined to it by a leader (Common smart labels).
+  const labels = createSmartLabelLayout(root, { width: WIDTH, height: HEIGHT, labelPad: 8, pathPad: 6, charWidthEm: 0.64 });
+  if (northArrowRect) labels.reserveRect(northArrowRect);
+  if (!offsetLayout) labels.reserveRect(remarkRect);
+  [P.oa1, P.track, P.target].forEach((point) => labels.reservePoint(point, 11));
+  if (aimOffVisible) labels.reservePoint(P.aimOff, 9);
+  const reserve = (points, pad = 6) => { for (let i = 1; i < points.length; i += 1) labels.reserveSegment(points[i - 1], points[i], pad); };
+  reserve([P.ingress, P.oa1]);
+  reserve([P.oa1, P.target]);
+  reserve([P.track, P.target]);
+  reserve(P.rollPath);
+  if (lateralDimension) reserve([lateralDimension.a, lateralDimension.b], 4);
+  if (aimOffVisible) reserve([P.target, P.aimOff]);
+  const titleSize = SVG_DIAGRAM_STYLE_V0_1.font.lineTitlePx * textScale;
+  const detailSize = SVG_DIAGRAM_STYLE_V0_1.font.detailPx * textScale;
+  const label = (point, text, labelOptions) => labels.append(point, text, {
+    background: false,
+    movable: options.movableLabels === true,
+    fontSize: titleSize,
+    detailFontSize: detailSize,
+    leaderMarkerId: "bdp-top-leader",
+    ...labelOptions,
+  });
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const awaySide = (a, b) => {
+    // Beside a line, on the side away from the Ground Range circle centre.
+    const d = unit(a, b);
+    const m = mid(a, b);
+    return (-d.y) * (m.x - P.target.x) + d.x * (m.y - P.target.y) >= 0 ? 1 : -1;
+  };
+  label(P.target, `Angle-Off ${formatDeg(input.angleOffDeg)}°`, {
+    labelKey: "angle-off", color: C.frame, fontSize: (offsetLayout ? 12 : 17) * textScale,
+    candidates: [{ dx: 0, dy: -24, anchor: "middle" }, { dx: 22, dy: -22, anchor: "start" }, { dx: -22, dy: -22, anchor: "end" }, { dx: 0, dy: -52, anchor: "middle" }],
+  });
+  label(P.target, "Target", {
+    labelKey: "target", color: C.frame, fontSize: 12 * textScale,
+    candidates: [{ dx: 14, dy: 20, anchor: "start" }, { dx: -14, dy: 20, anchor: "end" }, { dx: 0, dy: 34, anchor: "middle" }, { dx: 24, dy: 42, anchor: "start" }],
+  });
+  const oneLine = options.oneLineLabels === true;
+  label(mid(P.track, P.target), oneLine ? `MAP: ${formatNm(groundRangeNm)} NM` : "MAP", {
+    labelKey: "map", color: C.mapText, detail: oneLine ? undefined : `${formatNm(groundRangeNm)} NM`,
+    candidates: lineCandidates(P.track, P.target, awaySide(P.track, P.target) * -1),
+  });
+  // Angle label in the compact `Title: value` form (G2). A small angle leaves no room inside its
+  // wedge, so the label goes just outside either side line first (leader to the arc), then out along
+  // the arc's bisector.
+  const outwardOf = (ray) => {
+    let off = ray - leadMid;
+    while (off > Math.PI) off -= 2 * Math.PI;
+    while (off <= -Math.PI) off += 2 * Math.PI;
+    return ray + (off >= 0 ? 1 : -1) * (Math.PI / 2);
+  };
+  const anchorFor = (dx) => (dx > 6 ? "start" : dx < -6 ? "end" : "middle");
+  const sideCandidates = [toOa1, toOa1 + leadSweep].flatMap((ray) => {
+    const out = outwardOf(ray);
+    return [0.9, 1.5].flatMap((along) => [16, 40].map((offset) => {
+      const x = P.target.x + Math.cos(ray) * leadRadius * along + Math.cos(out) * offset;
+      const y = P.target.y + Math.sin(ray) * leadRadius * along + Math.sin(out) * offset;
+      return { dx: x - leadAnchorPoint.x, dy: y - leadAnchorPoint.y + 5, anchor: anchorFor(Math.cos(out) * 10) };
+    }));
+  });
+  label(leadAnchorPoint, `Roll-in Lead Angle: ${formatDeg(pub.leadAngleDeg)}°`, {
+    labelKey: "lead-angle", color: C.rollInTarget,
+    candidates: [...sideCandidates, ...[12, 34, 60, 90].map((distance) => {
+      const dx = Math.cos(leadMid) * distance;
+      return { dx, dy: Math.sin(leadMid) * distance + 5, anchor: anchorFor(dx) };
+    })],
+  });
+  if (radialRange) label(mid(P.target, P.oa1), offsetLayout ? `Roll-in Range: ${formatNm(pub.rollInRangeNm)} NM` : "Roll-in Range", {
+    labelKey: "roll-in-range", color: C.rollInTarget, fontSize: SVG_DIAGRAM_STYLE_V0_1.font.dimensionTitlePx * textScale,
+    candidates: lineCandidates(P.target, P.oa1, awaySide(P.target, P.oa1)),
+    textAttributes: { "data-top-view-role": "roll-in-range" },
+  });
+  label(P.oa1, "Roll-in", {
+    labelKey: "roll-in", color: C.rollInText, fontSize: 12 * textScale,
+    detail: radialRange ? rollInAngleRangeText(pub) : undefined,
+    textAttributes: { "data-top-view-role": "roll-in" },
+    candidates: [{ dx: 0, dy: 28, anchor: "middle" }, { dx: -14, dy: 24, anchor: "end" }, { dx: 14, dy: 24, anchor: "start" }, { dx: 0, dy: 48, anchor: "middle" }],
+  });
+  // Offset layout, Advanced only: Roll-in Radius (the real turn radius, owner 2026-11-10) at the tightest point of the turn.
+  if (offsetLayout && advanced && Number.isFinite(Number(pub.rollInTurnRadiusNm)) && P.rollPath.length > 1) {
+    const at = P.rollTurnPoint ?? P.rollPath[Math.floor(P.rollPath.length / 2)];
+    const out = unit(P.target, at);
+    label(at, `Roll-in Radius: ${formatNm(pub.rollInTurnRadiusNm)} NM`, {
+      labelKey: "roll-in-radius", color: C.rollInText, fontSize: 12 * textScale,
+      textAttributes: { "data-top-view-role": "roll-in-radius" },
+      candidates: [16, 40, 70].flatMap((distance) => [
+        { dx: out.x * distance, dy: out.y * distance + 4, anchor: out.x >= 0 ? "start" : "end" },
+        { dx: -out.x * distance, dy: -out.y * distance + 4, anchor: out.x >= 0 ? "end" : "start" },
+      ]),
+    });
+  }
+  label(P.track, "Track Point", {
+    labelKey: "track-point", color: C.rollInText, fontSize: 12 * textScale,
+    candidates: [{ dx: 14, dy: -8, anchor: "start" }, { dx: -14, dy: -8, anchor: "end" }, { dx: 14, dy: 20, anchor: "start" }, { dx: -14, dy: 20, anchor: "end" }, { dx: 30, dy: -30, anchor: "start" }, { dx: -30, dy: -30, anchor: "end" }],
+  });
+  if (aimOffVisible) label(P.aimOff, "Aim-off Point", {
+    labelKey: "aim-off", color: C.aimOff, fontSize: 12 * textScale,
+    candidates: [{ dx: 12, dy: -8, anchor: "start" }, { dx: -12, dy: -8, anchor: "end" }, { dx: 12, dy: 20, anchor: "start" }, { dx: -12, dy: 20, anchor: "end" }, { dx: 30, dy: -30, anchor: "start" }],
+  });
+  if (lateralDimension) {
+    const dimensionMid = mid(lateralDimension.a, lateralDimension.b);
+    const out = unit(P.track, P.initialExtension);
+    label(dimensionMid, "Roll-in Lat. D", {
+      labelKey: "lateral-distance", color: C.initialTrack, fontSize: SVG_DIAGRAM_STYLE_V0_1.font.dimensionTitlePx * textScale,
+      detail: `${formatNm(Math.abs(lateralNm))} NM`,
+      candidates: [14, 40, 70].flatMap((distance) => [
+        { dx: out.x * distance, dy: out.y * distance + 4, anchor: out.x >= 0 ? "start" : "end" },
+        { dx: -out.x * distance, dy: -out.y * distance + 4, anchor: out.x >= 0 ? "end" : "start" },
+      ]),
+    });
+  }
+  const initialSpeedText = input.initialSpeedMode === "MACH"
+    ? `Mach ${formatMach(input.initialSpeedValue)}`
+    : `${formatKt(pub.resolvedInitialSpeedKcas)} KCAS`;
+  // North-up: the Initial label also carries the true heading of the Initial → OA1 leg, and the ingress
+  // can point any way, so it gets candidates on every side.
+  const initialCandidates = [{ dx: 0, dy: 44, anchor: "start" }, { dx: 0, dy: -18, anchor: "start" }, { dx: 0, dy: 64, anchor: "start" }, { dx: 10, dy: 84, anchor: "start" }];
+  if (northUp) initialCandidates.push({ dx: -12, dy: 44, anchor: "end" }, { dx: -12, dy: -18, anchor: "end" }, { dx: 16, dy: 5, anchor: "start" }, { dx: -16, dy: 5, anchor: "end" });
+  label(P.ingress, "Initial", {
+    labelKey: "initial", color: C.initialTrack, fontSize: 15 * textScale, detailFontSize: 12.5 * textScale,
+    // A pattern host shows the entry altitude as Roll-in Altitude in the Remark, not here.
+    detail: [northUp ? headingText(Number(options.inHeadingDeg)) : null, patternHost ? null : `${formatFt(pub.resolvedInitialAltitudeMslFt)} ft MSL`, initialSpeedText].filter(Boolean).join(" · "),
+    candidates: initialCandidates,
+  });
+
+  applyTextHalo(root);
+  const zoom = applyBdpTopViewZoom(svg, options.zoom ?? 1);
+  scopeSvgMarkerIds(svg, options.scope ?? "bdp-top");
+  return {
+    title,
+    orientation: northUp ? "NORTH_UP" : BDP_TOP_VIEW_V0_2.orientation,
+    remark: Object.fromEntries(remarkRows),
+    rotationDeg: northUp ? null : (rotationRad * 180) / Math.PI,
+    inHeadingDeg: northUp ? Number(options.inHeadingDeg) : null,
+    upHeadingDeg: northUp ? upDeg : null,
+    canvas: { width: WIDTH, height: HEIGHT },
+    groundRangeCircleCenter: "TARGET",
+    rollInRangeNm: pub.rollInRangeNm,
+    rollInLateralDistanceNm: lateralShown ? Math.abs(lateralNm) : null,
+    // Offset layout: the Remark rows as legend-box items (label "Name · value", Offset legend format).
+    legend: offsetLayout ? remarkRows.map(([name, value]) => ({ label: `${name} · ${value}`, color: BDP_TOP_LEGEND_COLORS[name] ?? C.frame })) : null,
+    legendColumns: offsetLayout ? 2 : null,
+    groundRangeNm,
+    screen: { oa1: P.oa1, target: P.target, track: P.track },
+    zoom,
+  };
+}

@@ -1,0 +1,127 @@
+import { BOMB_DELIVERY_PLANNER_MODEL_V0_2, calculateBombDeliveryV0_2 } from "./bomb-delivery-planner-v0.2.mjs";
+import { cachedCalculation } from "../../../common/calculation/calculation-cache-v0.1.mjs";
+import { buildBombDeliveryVisualizationState } from "./visualization-state-v0.1.mjs";
+import { truncateBeOutput, truncateDecimals } from "../../../common/ui/display-precision-v0.1.mjs";
+import {
+  ROLL_IN_LOW_ANGLE_BOUNDARY_DEG,
+  autoRollInBankDeg as autoRollInBankDegFull,
+  isLevelTurnRollIn,
+  levelTurnRollInG as levelTurnRollInGFull,
+} from "./roll-in-v0.1.mjs";
+
+export const BOMB_DELIVERY_PLANNER_MODEL_V0_3 = Object.freeze({
+  id: "bomb-delivery-planner-v0.3-js-facade",
+  // 0.3.10 (2026-09-29): v0.2.8 core — ground-referenced Dive Angle in wind; local.aimOffDistanceFt.
+  // 0.3.11 (2026-10-01): v0.2.9 core — public.resolvedSolveMode.
+  // 0.3.12 (2026-10-02): v0.2.10 core — allowNegativeTrackingTime passthrough.
+  // 0.3.13 (2026-10-03): v0.2.11 core — public.rollInAngleOffDeg.
+  // 0.3.14 (2026-10-12): v0.2.13 core — trackingTimeStepSec 0.1 passthrough (present only when set).
+  version: "0.3.14",
+  calculationSource: "bomb-delivery-planner-v0.2-sem-nlt",
+  officialOracle: "Bomb Profile REV.1.9 · R_20260830",
+});
+
+const REQUIRED_CANONICAL_FIELDS = Object.freeze([
+  "targetElevationMslFt",
+  "releaseSpeedKcas",
+  "diveAngleDeg",
+  "initialSpeedValue",
+  "initialSpeedMode",
+  "initialAltitudeMslFt",
+  "releaseAltitudeMslFt",
+  "angleOffDeg",
+  "rollInBankAngleDeg",
+  "rollInG",
+]);
+
+function requireCanonicalInput(rawInput) {
+  if (!rawInput || typeof rawInput !== "object") throw new TypeError("rawInput must be an object");
+  for (const field of REQUIRED_CANONICAL_FIELDS) {
+    if (rawInput[field] === undefined || rawInput[field] === null) {
+      throw new TypeError(`${field} is required by the BDP v0.3 canonical input contract`);
+    }
+  }
+  const solveMode = rawInput.solveMode ?? "height";
+  if (solveMode === "time" && rawInput.trackingTimeSec === undefined) {
+    throw new TypeError("trackingTimeSec is required when solveMode is time");
+  }
+}
+
+function canonicalInput(rawInput) {
+  requireCanonicalInput(rawInput);
+  if (rawInput.windSpeedMps !== undefined || rawInput.windSpeed !== undefined) {
+    throw new TypeError("BDP v0.3 wind input uses windSpeedKt only; m/s wind aliases are not supported");
+  }
+  const windSpeedKt = rawInput.windSpeedKt ?? 0;
+  return {
+    weaponId: rawInput.weaponId ?? "M82",
+    fragmentHeightMarginPercent: rawInput.fragmentHeightMarginPercent ?? 20,
+    targetElevationMslFt: rawInput.targetElevationMslFt,
+    releaseSpeedKcas: rawInput.releaseSpeedKcas,
+    speedOvershootKcas: rawInput.speedOvershootKcas ?? 50,
+    maneuverInitiationDelaySec: rawInput.maneuverInitiationDelaySec ?? 0,
+    recoveryG: rawInput.recoveryG ?? 5,
+    gOnsetTimeSec: rawInput.gOnsetTimeSec ?? 2,
+    diveAngleDeg: rawInput.diveAngleDeg,
+    releaseFpaDeg: rawInput.releaseFpaDeg ?? -rawInput.diveAngleDeg,
+    windDirectionDeg: rawInput.windDirectionDeg ?? 0,
+    windSpeedKt,
+    initialSpeedValue: rawInput.initialSpeedValue,
+    initialSpeedMode: rawInput.initialSpeedMode,
+    initialAltitudeMslFt: rawInput.initialAltitudeMslFt,
+    solveMode: rawInput.solveMode ?? "height",
+    allowNegativeTrackingTime: rawInput.allowNegativeTrackingTime === true,
+    trackingTimeSec: rawInput.trackingTimeSec ?? 0,
+    // Whole seconds unless a caller opts into 0.1 s (kept out of the canonical input otherwise).
+    ...(rawInput.trackingTimeStepSec === undefined || rawInput.trackingTimeStepSec === 1 ? {} : { trackingTimeStepSec: rawInput.trackingTimeStepSec }),
+    releaseAltitudeMslFt: rawInput.releaseAltitudeMslFt,
+    angleOffDeg: rawInput.angleOffDeg,
+    rollInBankAngleDeg: rawInput.rollInBankAngleDeg,
+    rollInG: rawInput.rollInG,
+    ballisticModelId: rawInput.ballisticModelId,
+  };
+}
+
+// Full-precision result for BE-to-BE composition (Offset, BOX, Wheel). FE-facing callers use
+// calculateBombDeliveryV0_3, whose output is truncated to 5 decimals (docs/FE-BE-RULES.md).
+// Inside an owning BE call (common/calculation/calculation-cache-v0.1.mjs) one canonical input is
+// solved once (Offset candidates and the VRP-start reference re-composition revisit the same
+// profiles); the key is the whole canonical input plus the v0.3 / v0.2 model versions.
+export function calculateBombDeliveryV0_3Full(rawInput) {
+  const input = canonicalInput(rawInput);
+  return cachedCalculation("bdp-v0.3", { model: BOMB_DELIVERY_PLANNER_MODEL_V0_3, core: BOMB_DELIVERY_PLANNER_MODEL_V0_2, input }, () => solveCanonical(input));
+}
+
+function solveCanonical(input) {
+  const calculation = calculateBombDeliveryV0_2(input);
+  const state = buildBombDeliveryVisualizationState(calculation);
+
+  return {
+    model: { ...BOMB_DELIVERY_PLANNER_MODEL_V0_3 },
+    canonicalInputs: input,
+    public: calculation.public,
+    local: calculation.local,
+    safety: calculation.safety,
+    states: state.stations,
+    visualization: {
+      ...calculation.visualization,
+      semanticState: state,
+    },
+    diagnostics: {
+      ...calculation.diagnostics,
+      calculationModel: calculation.model,
+    },
+  };
+}
+
+export function calculateBombDeliveryV0_3(rawInput) {
+  return truncateBeOutput(calculateBombDeliveryV0_3Full(rawInput));
+}
+
+export const calculateBombDelivery = calculateBombDeliveryV0_3;
+
+// Roll-in mode rule for FE AUTO Bank and level-turn Bank↔G coupling (SPEC §5, §6.2). The public
+// helpers return 5-decimal truncated values (docs/FE-BE-RULES.md); the *Full forms keep full precision.
+export { ROLL_IN_LOW_ANGLE_BOUNDARY_DEG, isLevelTurnRollIn, autoRollInBankDegFull, levelTurnRollInGFull };
+export const autoRollInBankDeg = (input) => truncateDecimals(autoRollInBankDegFull(input));
+export const levelTurnRollInG = (rollInBankAngleDeg) => truncateDecimals(levelTurnRollInGFull(rollInBankAngleDeg));

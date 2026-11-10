@@ -1,0 +1,335 @@
+import { casToTas, tasToCas } from "../../../common/airspeed/airspeed-v0.1.mjs";
+import { calculateBombTrajectory, ACTIVE_BALLISTIC_MODEL_ID } from "./ballistics-v0.1.mjs";
+import { calculateDeliveryGeometry } from "./delivery-geometry-v0.1.mjs";
+import { calculateFragmentData, calculateLegacySafety } from "./safety-legacy-v0.1.mjs";
+import { calculateSemNltSafety } from "./safety-sem-v0.2.mjs";
+import { getWeaponById } from "./weapon-data-v0.1.mjs";
+
+const FT_PER_NM = 6076.11549;
+const MPS_PER_KT = 0.5144444444444445;
+const MIN_NLT_DIVE_ANGLE_DEG = 10;
+
+// Roll-in Radius (owner 2026-11-10, BDP SPEC §8): the real horizontal turn radius of the Roll-in path — the smallest
+// ground radius of curvature between two path samples (ground arc ÷ heading change), i.e. where the turn is
+// tightest (in the Roll-in G hold). Radius (EFF) (whole ground arc ÷ Angle Off) also counts the 1 G roll, the G
+// onset and the roll-out, where the aircraft flies far and turns little, so it reads up to ~2x too large; it stays
+// as rollInRadiusNm for its legacy consumers (BOX v0.1 bridge) only. The center is the center of curvature there.
+// Model-agnostic: Roll-in v0.1 and v0.2 samples both carry position and heading change.
+function rollInTurnRadius(samples) {
+  let best = null;
+  for (let i = 1; i < samples.length; i += 1) {
+    const a = samples[i - 1];
+    const b = samples[i];
+    const dHeading = b.headingChangeRad - a.headingChangeRad;
+    if (!(dHeading > 1e-6)) continue;
+    const radiusFt = (b.groundArcFt - a.groundArcFt) / dHeading;
+    if (!best || radiusFt < best.radiusFt) best = { radiusFt, a, b };
+  }
+  if (!best) return null;
+  const { radiusFt, a, b } = best;
+  const heading = (a.headingChangeRad + b.headingChangeRad) / 2;
+  const point = { forwardFt: (a.forwardFt + b.forwardFt) / 2, turnSideFt: (a.turnSideFt + b.turnSideFt) / 2 };
+  // The heading grows toward +turnSide, so the center lies to the left of the travel direction in (forward, turnSide).
+  const center = { forwardFt: point.forwardFt - radiusFt * Math.sin(heading), turnSideFt: point.turnSideFt + radiusFt * Math.cos(heading) };
+  const nm = (q) => ({ forwardNm: q.forwardFt / FT_PER_NM, turnSideNm: q.turnSideFt / FT_PER_NM });
+  return { radiusNm: radiusFt / FT_PER_NM, point: nm(point), center: nm(center) };
+}
+
+export const BOMB_DELIVERY_PLANNER_MODEL_V0_2 = Object.freeze({
+  id: "bomb-delivery-planner-v0.2-sem-nlt",
+  // 0.2.8 (2026-09-29): Dive Angle is the ground-referenced flight path (FPM line) in wind — the
+  // bomb leaves along it at ground speed and tracking runs at ground speed (SPEC §8); local AOD in ft.
+  // 0.2.9 (2026-10-01): public.resolvedSolveMode reports the mode actually used ("time" at Dive 0°).
+  // 0.2.10 (2026-10-02): opt-in allowNegativeTrackingTime — in height mode a Roll-in Altitude below
+  // Release + Roll-in loss gives a negative Tracking Time (the altitude to add) instead of an error.
+  // 0.2.11 (2026-10-03): public.rollInAngleOffDeg (Roll-in Point nose → Target angle).
+  // 0.2.12 (2026-10-12): time mode solves the Initial Altitude fixed point by secant (converged,
+  // about 6 Roll-in integrations instead of 30 damped steps).
+  // 0.2.13 (2026-10-12): opt-in trackingTimeStepSec 0.1 (Offset, user) — the entered Tracking Time is
+  // rounded to 0.1 s instead of whole seconds; the default stays whole seconds.
+  // Behavior-preserving hook (2026-10-15): calculateBombDeliveryV0_2(input, { rollIn }) runs another Roll-in
+  // integrator (BDP v0.4, Roll-in v0.2). Without options the results are unchanged; version stays 0.2.13.
+  // Behavior-preserving hook (2026-10-27, owner, POP-UP SPEC §13.6): options.nltAllDives (BDP v0.4) computes the
+  // SEM NLT at every Dive (NLT = MINALT at 0°) instead of MINALT-only below 10°. Without it nothing changes.
+  // Behavior-preserving hook (2026-11-10, owner, SPEC §6.11): options.adjustNlt({ safety, weapon }) (BDP v0.4) may
+  // return { nltReleaseMslFt, ... } to replace the SEM NLT (the NLT after impact); the Release clamp uses it and
+  // safety.pullNltReleaseMslFt / safety.nltAfterImpact keep the record. Without it nothing changes.
+  version: "0.2.13",
+  flightPathReference: "GROUND",
+  legacyGeometrySource: "Bomb Profile REV.1.9 · R_20260830",
+  applicability: Object.freeze({
+    minAltOnlyBelowDiveAngleDeg: MIN_NLT_DIVE_ANGLE_DEG,
+  }),
+});
+
+function finite(name, value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
+}
+
+// Entered Tracking Time unit: whole seconds (default, user 2026-10-01) or 0.1 s (opt-in, 2026-10-12).
+function roundEnteredTrackingTime(value, stepSec = 1) {
+  if (stepSec !== 1 && stepSec !== 0.1) throw new RangeError("trackingTimeStepSec must be 1 or 0.1");
+  return stepSec === 1 ? Math.round(value) : Math.round(value * 10) / 10;
+}
+
+function normalizeInput(raw) {
+  const diveAngleDeg = raw.diveAngleDeg ?? raw.diveAngle;
+  if (raw.windSpeedMps !== undefined || raw.windSpeed !== undefined) {
+    throw new TypeError("BDP v0.2 wind input uses windSpeedKt only; m/s wind aliases are not supported");
+  }
+  const windSpeedKt = raw.windSpeedKt ?? 0;
+  return {
+    weaponId: raw.weaponId ?? "M82",
+    fragmentHeightMarginPercent: raw.fragmentHeightMarginPercent ?? 20,
+    targetElevationMslFt: raw.targetElevationMslFt ?? raw.targetElevation,
+    releaseSpeedKcas: raw.releaseSpeedKcas ?? raw.releaseSpeed,
+    speedOvershootKcas: raw.speedOvershootKcas ?? raw.rnltSpeedMargin ?? 50,
+    // Compatibility/legacy-diagnostic input only. V2 NLT does not apply a pre-G-onset delay.
+    maneuverInitiationDelaySec:
+      raw.maneuverInitiationDelaySec ?? raw.maneuverTime ?? 0,
+    recoveryG: raw.recoveryG ?? raw.escapeG ?? 5,
+    gOnsetTimeSec: raw.gOnsetTimeSec ?? 2,
+    diveAngleDeg,
+    releaseFpaDeg: raw.releaseFpaDeg ?? -diveAngleDeg,
+    windDirectionDeg: raw.windDirectionDeg ?? raw.windDirection ?? 0,
+    windSpeedKt,
+    initialSpeedValue: raw.initialSpeedValue ?? raw.initialSpeed,
+    initialSpeedMode: raw.initialSpeedMode ?? raw.initialUnit ?? "CAS",
+    enteredInitialAltitudeMslFt: raw.initialAltitudeMslFt ?? raw.initialAltitude,
+    solveMode: raw.solveMode ?? "height",
+    // Opt-in (2026-10-02, Offset / BDP FE): in height mode a Roll-in Altitude too low for the
+    // roll-in loss gives a negative Tracking Time instead of an error, so the pilot sees how far
+    // short the altitude is. Default false keeps the error for the pattern BEs.
+    allowNegativeTrackingTime: raw.allowNegativeTrackingTime === true,
+    enteredTrackingTimeSec: roundEnteredTrackingTime(raw.trackingTimeSec ?? raw.trackingTime ?? 0, raw.trackingTimeStepSec ?? 1),
+    enteredReleaseAltitudeMslFt: raw.releaseAltitudeMslFt ?? raw.releaseMsl,
+    angleOffDeg: raw.angleOffDeg ?? raw.rollHeading,
+    rollInBankAngleDeg: raw.rollInBankAngleDeg ?? raw.rollBank,
+    rollInG: raw.rollInG ?? raw.rollG,
+    ballisticModelId: raw.ballisticModelId ?? ACTIVE_BALLISTIC_MODEL_ID,
+    ...(raw.rollInOnset === undefined ? {} : { rollInOnset: raw.rollInOnset }),
+  };
+}
+
+function validate(p, { rollInBankSolved = false, nltAllDives = false } = {}) {
+  [
+    "fragmentHeightMarginPercent",
+    "targetElevationMslFt",
+    "releaseSpeedKcas",
+    "diveAngleDeg",
+    "releaseFpaDeg",
+    "windDirectionDeg",
+    "windSpeedKt",
+    "initialSpeedValue",
+    "enteredInitialAltitudeMslFt",
+    "enteredTrackingTimeSec",
+    "enteredReleaseAltitudeMslFt",
+    "angleOffDeg",
+    ...(rollInBankSolved ? [] : ["rollInBankAngleDeg"]),
+    "rollInG",
+  ].forEach((name) => finite(name, p[name]));
+  if (p.fragmentHeightMarginPercent < 0) throw new RangeError("fragmentHeightMarginPercent must be >= 0");
+  if (!(p.releaseSpeedKcas > 0)) throw new RangeError("releaseSpeedKcas must be > 0");
+  if (!(p.diveAngleDeg >= 0 && p.diveAngleDeg < 90)) throw new RangeError("diveAngleDeg must be >= 0 and < 90");
+  if (!(p.releaseFpaDeg <= 0 && p.releaseFpaDeg > -90)) throw new RangeError("releaseFpaDeg must be <= 0 and > -90");
+  if (!(p.windSpeedKt >= 0)) throw new RangeError("windSpeedKt must be >= 0");
+  if (!(p.enteredReleaseAltitudeMslFt > p.targetElevationMslFt)) throw new RangeError("Release altitude must be above Target elevation");
+  if (!(p.initialSpeedValue > 0)) throw new RangeError("initialSpeedValue must be > 0");
+  if (p.initialSpeedMode !== "CAS" && p.initialSpeedMode !== "MACH") throw new RangeError("initialSpeedMode must be CAS or MACH");
+  if (!(p.angleOffDeg > 0 && p.angleOffDeg < 180)) throw new RangeError("angleOffDeg must be > 0 and < 180");
+  if (!rollInBankSolved && !(p.rollInBankAngleDeg > 0 && p.rollInBankAngleDeg < 180)) throw new RangeError("rollInBankAngleDeg must be > 0 and < 180");
+  if (!(p.rollInG > 1 && p.rollInG <= 9)) throw new RangeError("rollInG must be > 1 and <= 9");
+  if (p.diveAngleDeg > 0 && p.solveMode === "height" && !p.allowNegativeTrackingTime && !(p.enteredInitialAltitudeMslFt > p.enteredReleaseAltitudeMslFt)) {
+    throw new RangeError("Initial altitude must be above entered Release altitude in height mode");
+  }
+  if ((p.solveMode === "time" || Math.abs(p.diveAngleDeg) < 1e-9) && !(p.enteredTrackingTimeSec > 0)) {
+    throw new RangeError("Tracking Time must be > 0");
+  }
+
+  // Below 10° the project contract is MINALT-only (unless options.nltAllDives). NLT/SEM inputs are unused and must not
+  // invalidate geometry/ballistics.
+  if (nltAllDives || p.diveAngleDeg >= MIN_NLT_DIVE_ANGLE_DEG) {
+    [
+      "speedOvershootKcas",
+      "maneuverInitiationDelaySec",
+      "recoveryG",
+      "gOnsetTimeSec",
+    ].forEach((name) => finite(name, p[name]));
+    if (!(p.speedOvershootKcas >= 0)) throw new RangeError("speedOvershootKcas must be >= 0");
+    if (!(p.maneuverInitiationDelaySec >= 0)) throw new RangeError("maneuverInitiationDelaySec must be >= 0");
+    if (!(p.recoveryG > 1 && p.recoveryG <= 9)) throw new RangeError("recoveryG must be > 1 and <= 9");
+    if (!(p.gOnsetTimeSec > 0)) throw new RangeError("gOnsetTimeSec must be > 0");
+  }
+}
+
+function calculateMinAltOnlySafety({ weapon, targetElevationMslFt, releaseFpaDeg, fragmentHeightMarginPercent }) {
+  const fragments = calculateFragmentData({ weapon, targetElevationMslFt });
+  const minAltAglFt = fragments.fragmentMaximumAltitudeAglFt * (1 + fragmentHeightMarginPercent / 100);
+  const minAltMslFt = targetElevationMslFt + minAltAglFt;
+  return {
+    model: { id: "minalt-only-v0.1", version: "0.1.0" },
+    applicability: "MINALT_ONLY",
+    ...fragments,
+    minAltAglFt,
+    minAltMslFt,
+    nltReleaseMslFt: null,
+    recoverySpeedKcas: null,
+    releaseFpaDeg,
+    recoveryAtNlt: null,
+  };
+}
+
+// options.rollIn = { integrate, solvesBank } (BDP v0.4): the Roll-in integrator to use, and whether it solves
+// the Roll-in Bank itself (then rollInBankAngleDeg is not required). The result then also carries `rollIn`.
+// options.nltAllDives (BDP v0.4): the SEM NLT at every Dive; the legacy RNLT diagnostic stays at 10° and above.
+export function calculateBombDeliveryV0_2(rawInput, options = {}) {
+  const input = normalizeInput(rawInput);
+  const rollIn = options.rollIn ?? null;
+  const nltAllDives = options.nltAllDives === true;
+  validate(input, { rollInBankSolved: rollIn?.solvesBank === true, nltAllDives });
+  const weapon = getWeaponById(input.weaponId);
+  const nltSupported = nltAllDives || input.diveAngleDeg >= MIN_NLT_DIVE_ANGLE_DEG;
+
+  let safety = nltSupported
+    ? calculateSemNltSafety({
+        weapon,
+        fragmentHeightMarginPercent: input.fragmentHeightMarginPercent,
+        targetElevationMslFt: input.targetElevationMslFt,
+        releaseSpeedKcas: input.releaseSpeedKcas,
+        speedOvershootKcas: input.speedOvershootKcas,
+        releaseFpaDeg: input.releaseFpaDeg,
+        recoveryG: input.recoveryG,
+        gOnsetTimeSec: input.gOnsetTimeSec,
+      })
+    : calculateMinAltOnlySafety({
+        weapon,
+        fragmentHeightMarginPercent: input.fragmentHeightMarginPercent,
+        targetElevationMslFt: input.targetElevationMslFt,
+        releaseFpaDeg: input.releaseFpaDeg,
+      });
+
+  if (nltSupported && typeof options.adjustNlt === "function") {
+    const adjusted = options.adjustNlt({ safety, weapon });
+    if (adjusted) safety = { ...safety, pullNltReleaseMslFt: safety.nltReleaseMslFt, nltReleaseMslFt: adjusted.nltReleaseMslFt, nltAfterImpact: adjusted };
+  }
+
+  const effectiveReleaseAltitudeMslFt = nltSupported
+    ? Math.max(input.enteredReleaseAltitudeMslFt, safety.nltReleaseMslFt)
+    : input.enteredReleaseAltitudeMslFt;
+  const releaseAglFt = effectiveReleaseAltitudeMslFt - input.targetElevationMslFt;
+  const releaseTasKt = casToTas(input.releaseSpeedKcas, effectiveReleaseAltitudeMslFt);
+  const bomb = calculateBombTrajectory({
+    params: {
+      diveAngleDeg: input.diveAngleDeg,
+      releaseAglFt,
+      windDirectionDeg: input.windDirectionDeg,
+      // Ballistics keeps SI wind internally; BDP canonical/user-facing unit is knots.
+      windSpeedMps: input.windSpeedKt * MPS_PER_KT,
+      flightPathReference: "GROUND",
+    },
+    weapon,
+    releaseTasKt,
+    modelId: input.ballisticModelId,
+  });
+  const profile = calculateDeliveryGeometry({ input, bomb, effectiveReleaseAltitudeMslFt, ...(rollIn ? { rollIn: rollIn.integrate } : {}) });
+  const turnRadius = rollInTurnRadius(profile.roll.samples);
+  const resolvedInitialSpeedKcas =
+    input.initialSpeedMode === "CAS"
+      ? input.initialSpeedValue
+      : tasToCas(profile.initialTasKt, profile.initialMslFt);
+
+  const legacySafety = input.diveAngleDeg >= MIN_NLT_DIVE_ANGLE_DEG
+    ? calculateLegacySafety({
+        weapon,
+        targetElevationMslFt: input.targetElevationMslFt,
+        releaseSpeedKcas: input.releaseSpeedKcas,
+        speedOvershootKcas: input.speedOvershootKcas,
+        diveAngleDeg: input.diveAngleDeg,
+        escapeG: input.recoveryG,
+        maneuverDelaySec: input.maneuverInitiationDelaySec,
+      })
+    : null;
+
+  return {
+    model: { ...BOMB_DELIVERY_PLANNER_MODEL_V0_2 },
+    weapon,
+    inputs: input,
+    public: {
+      effectiveReleaseAltitudeMslFt: profile.effectiveReleaseAltitudeMslFt,
+      resolvedInitialAltitudeMslFt: profile.initialMslFt,
+      resolvedInitialSpeedKcas,
+      trackPointAltitudeMslFt: profile.trackMslFt,
+      trackingTimeSec: profile.trackingTimeSec,
+      // Mode actually used: a level delivery (Dive 0°) always takes Tracking Time as its input
+      // whatever solveMode says, so FEs must treat Tracking Time as the input there (SPEC §6.2).
+      resolvedSolveMode: profile.levelDelivery ? "time" : input.solveMode,
+      rollInRangeNm: profile.rollInRangeFt / FT_PER_NM,
+      groundRangeNm: profile.groundRangeFt / FT_PER_NM,
+      downRangeTravelNm: profile.downRangeTravelFt / FT_PER_NM,
+      bombRangeNm: bomb.bombRangeFt / FT_PER_NM,
+      bombTofSec: bomb.bombTofSec,
+      rollInRadiusNm: profile.roll.equivalentRadiusFt / FT_PER_NM,
+      rollInTurnRadiusNm: turnRadius ? turnRadius.radiusNm : null,
+      rollInTimeSec: profile.roll.rollInTimeSec,
+      rollInGroundArcNm: profile.roll.groundArcFt / FT_PER_NM,
+      rollInDisplacement: {
+        forwardNm: profile.roll.displacementForwardFt / FT_PER_NM,
+        turnSideNm: profile.roll.displacementTurnSideFt / FT_PER_NM,
+      },
+      baseDistanceNm: Math.abs(profile.targetTurnSideFt) / FT_PER_NM,
+      baseDistanceSlantNm: Math.hypot(profile.initialAglFt, Math.abs(profile.targetTurnSideFt)) / FT_PER_NM,
+      rollInAltitudeLossFt: profile.roll.altitudeLossFt,
+      leadAngleDeg: profile.leadAngleDeg,
+      // Roll-in Angle Off (TERMINOLOGY, user 2026-10-03): at the Roll-in Point, the angle between the
+      // aircraft nose (Initial heading) and the line to the Target = Angle Off − Roll-in Lead Angle.
+      rollInAngleOffDeg: Math.abs(profile.targetBearingDeg),
+      minAltMslFt: safety.minAltMslFt,
+      nltReleaseMslFt: safety.nltReleaseMslFt,
+    },
+    local: {
+      aimOffPointRangeNm: profile.aimOffRangeFt === null ? null : profile.aimOffRangeFt / FT_PER_NM,
+      aimOffAngleDeg: profile.aimOffAngleDeg,
+      aimOffDistanceNm: bomb.aimOffDistanceFt === null ? null : bomb.aimOffDistanceFt / FT_PER_NM,
+      // AOD display unit is ft (user decision 2026-09-29); the NM key stays for compatibility.
+      aimOffDistanceFt: bomb.aimOffDistanceFt,
+      rollInRangeProfileFitNm: (profile.rollInRangeFt - profile.groundRangeFt) / FT_PER_NM,
+      legacyOffsetLeadDeg: profile.legacyOffsetLeadDeg,
+    },
+    visualization: {
+      // Roll-in Radius construction (owner 2026-11-10): the tightest point of the Roll-in and its center.
+      rollInTurnRadius: turnRadius ? { point: turnRadius.point, center: turnRadius.center } : null,
+      rollInTrajectorySamples: profile.roll.samples.map((sample) => ({
+        forwardNm: sample.forwardFt / FT_PER_NM,
+        turnSideNm: sample.turnSideFt / FT_PER_NM,
+        groundArcNm: sample.groundArcFt / FT_PER_NM,
+        altitudeLossFt: sample.altitudeLossFt,
+        headingChangeDeg: (sample.headingChangeRad * 180) / Math.PI,
+      })),
+      bombTrajectorySamples: bomb.samples.map((sample) => ({
+        downRangeNm: sample.xFt / FT_PER_NM,
+        altitudeAglFt: sample.altitudeAglFt,
+      })),
+    },
+    safety: {
+      model: safety.model,
+      applicability: safety.applicability ?? "NLT_SUPPORTED",
+      recoverySpeedKcas: safety.recoverySpeedKcas,
+      releaseFpaDeg: safety.releaseFpaDeg,
+      recoveryAtNlt: safety.recoveryAtNlt,
+      ...(safety.nltAfterImpact ? { pullNltReleaseMslFt: safety.pullNltReleaseMslFt, nltAfterImpact: safety.nltAfterImpact } : {}),
+    },
+    diagnostics: {
+      targetForwardNm: profile.targetForwardFt / FT_PER_NM,
+      targetTurnSideNm: profile.targetTurnSideFt / FT_PER_NM,
+      initialTasKt: profile.initialTasKt,
+      releaseTasKt: profile.releaseTasKt,
+      ballisticModelId: bomb.modelId,
+      ballisticModelVersion: bomb.modelVersion,
+      flightPathReference: bomb.flightPathReference,
+      releaseGroundVelocityFps: bomb.releaseGroundVelocityFps,
+      legacyRnltReleaseMslFt: legacySafety?.legacyRnltReleaseMslFt ?? null,
+      nltSupported,
+    },
+    ...(rollIn ? { rollIn: profile.roll } : {}),
+  };
+}

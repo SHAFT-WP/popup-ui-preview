@@ -1,0 +1,416 @@
+import { casToTas, machToTas } from "../../../common/airspeed/airspeed-v0.1.mjs";
+import { calculateBombDeliveryV0_4Full as calculateBombDeliveryV0_4 } from "../bomb-delivery-planner/bomb-delivery-planner-v0.4.mjs";
+import { bdpWindDirectionDeg, nonFiniteResultFields, offsetAngleScanMaxDeg, offsetOnsetTurn, resolveOffsetTurn } from "./offset-be-v0.2.mjs";
+import { truncateBeOutput } from "../../../common/ui/display-precision-v0.1.mjs";
+import {
+  add,
+  angleOffFromOffsetHeading,
+  directionRule,
+  dot,
+  left,
+  lineIntersection,
+  mul,
+  offsetAngleFromAngleOff,
+  offsetHeadingFromOffset,
+  placeOffsetTurn,
+  right,
+  solveOffsetAngleForActionRange,
+  sub,
+  transformLocal,
+  vecHeading,
+} from "./offset-geometry-v0.2.mjs";
+
+export const OFFSET_FORMATION_GEOMETRY_V0_1 = Object.freeze({
+  id: "offset-formation-geometry-v0.1",
+  // 0.1.5 (2026-10-12): same Offset Angle scan range and shared root scan as offset-be-v0.2 0.2.8 (F4);
+  // Offset Speed / non-finite result guards come with resolveOffsetTurn (F5).
+  // 0.1.6 (2026-10-12, user: followers like #1): Approach Range as a range constraint (LOCK or driver,
+  // after an Action Range LOCK), its LOCK check, `headingDriver` (which of Attack Heading / Angle-Off
+  // a fixed Offset Angle or range solve holds, apart from the range driver), trackingTimeStepSec.
+  // 0.1.7 (2026-10-15, owner): delivery by BDP v0.4 (technique B Roll-in); the Roll-in Bank is solved, the
+  // onset rates pass through.
+  // 0.1.8 (2026-10-15, owner, BDP update R2.1): the Offset turn is the onset level turn of offset-be-v0.2 0.2.11.
+  // 0.1.9 (2026-10-15, owner R3): profile.fragmentMarginAppliesTo passes through to BDP v0.4.1.
+  // 0.1.10 (2026-10-19, owner): the Level SEM turn inputs pass through to BDP v0.4.3 (direction absent: the
+  // aircraft's Roll-in direction).
+  // 0.1.12 (owner 2026-11-03): no Turn Amount entered: the Level SEM turns to the reciprocal of the Run-In heading.
+  // 0.1.11 (2026-10-27, owner, POP-UP step 3b): profile.rollInStartFpaDeg / rollInSpeedModel pass through to BDP
+  // v0.4.5; absent, nothing changes.
+  // 0.1.13 (owner 2026-11-04): the CSEM defaults of offset BE 0.2.17 (Dive + 10°, the CSEM turn at 12,000 ft AGL).
+  version: "0.1.13",
+  status: "work",
+  purpose:
+    "Off-axis Offset geometry for a Flight follower whose IP is displaced from the shared Target-through Run-In axis by its Formation position, while Target and Run-In heading stay shared with its element lead. Reuses offset-geometry-v0.2.mjs's pure heading/vector helpers without modifying offset-be-v0.2.mjs or offset-geometry-v0.2.mjs's own single-aircraft (on-axis) contract.",
+});
+
+const FT_PER_NM = 6076.11549;
+const KT_TO_FPS = 1.687809857;
+const norm = (deg) => ((deg % 360) + 360) % 360;
+const near = (a, b, tolerance) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= tolerance;
+
+function finite(name, value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
+  return value;
+}
+
+function finitePoint(name, point) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw new TypeError(`${name} must be a finite {x,y} point`);
+  return point;
+}
+
+function speedToTas(speedValue, speedMode, altitudeMslFt) {
+  return speedMode === "MACH" ? machToTas(speedValue, altitudeMslFt) : casToTas(speedValue, altitudeMslFt);
+}
+
+// Level SEM turn amount when none is entered (owner 2026-11-03, "Ip to target 방향 반대 방향까지 선회"): from the
+// Attack Heading, in the turn's direction, to the reciprocal of the Run-In (IP to Target) heading. 0 = no turn.
+// The CSEM turn's Level Altitude when the profile leaves it blank (owner 2026-11-04: "12000피트", the short-range air
+// defence boundary), above the Target.
+export const OFFSET_CSEM_LEVEL_ALTITUDE_AGL_FT = 12000;
+export function semTurnToRunInReciprocalDeg(runInHeadingDeg, attackHeadingDeg, direction) {
+  if (!Number.isFinite(runInHeadingDeg) || !Number.isFinite(attackHeadingDeg)) return undefined;
+  const reciprocal = runInHeadingDeg + 180;
+  const raw = direction === "LEFT" ? attackHeadingDeg - reciprocal : reciprocal - attackHeadingDeg;
+  const change = ((raw % 360) + 360) % 360;
+  return change < 0.5 || change > 359.5 ? 0 : change;
+}
+
+function canonicalProfileInput(input, angleOffDeg, attackHeadingDeg, rollDirection, runInHeadingDeg) {
+  const profile = input.profile ?? {};
+  const diveAngleDeg = finite("diveAngleDeg", profile.diveAngleDeg ?? input.diveAngleDeg);
+  return {
+    weaponId: profile.weaponId ?? "M82",
+    targetElevationMslFt: finite("targetElevationMslFt", profile.targetElevationMslFt),
+    releaseSpeedKcas: finite("releaseSpeedKcas", profile.releaseSpeedKcas),
+    speedOvershootKcas: profile.speedOvershootKcas ?? 50,
+    fragmentHeightMarginPercent: profile.fragmentHeightMarginPercent ?? 20,
+    recoveryG: profile.recoveryG ?? 5,
+    gOnsetTimeSec: profile.gOnsetTimeSec ?? 2,
+    diveAngleDeg,
+    releaseFpaDeg: -diveAngleDeg,
+    windDirectionDeg: bdpWindDirectionDeg(profile, attackHeadingDeg),
+    windSpeedKt: profile.windSpeedKt ?? 0,
+    initialSpeedValue: finite("initialSpeedValue", profile.initialSpeedValue),
+    initialSpeedMode: profile.initialSpeedMode ?? "CAS",
+    initialAltitudeMslFt: finite("initialAltitudeMslFt", profile.initialAltitudeMslFt),
+    solveMode: profile.solveMode ?? "height",
+    allowNegativeTrackingTime: profile.allowNegativeTrackingTime === true,
+    trackingTimeSec: profile.trackingTimeSec ?? 0,
+    trackingTimeStepSec: profile.trackingTimeStepSec,
+    releaseAltitudeMslFt: finite("releaseAltitudeMslFt", profile.releaseAltitudeMslFt),
+    angleOffDeg,
+    rollInG: finite("rollInG", profile.rollInG),
+    // Developer option (BDP v0.4.1): the Fragment Height Margin on the radius too (default) or on the height only.
+    fragmentMarginAppliesTo: profile.fragmentMarginAppliesTo,
+    // The selected SEM (BDP v0.4.2; absent: LEVEL, +30°).
+    semEnd: profile.semEnd ?? undefined,
+    // CSEM (owner 2026-11-04): Target FPA blank = Dive + 10°; the CSEM turn levels at csemLevelAltitudeAglFt
+    // (blank 12,000 ft AGL) and turns like the Level SEM (BDP v0.4.6).
+    csemTargetFpaDeg: profile.csemTargetFpaDeg ?? (profile.semEnd === "CLIMB" ? (profile.diveAngleDeg ?? input.diveAngleDeg) + 10 : undefined),
+    // 0 = no CSEM turn (the CSEM End held, as before).
+    csemLevelAltitudeAglFt: profile.semEnd === "CLIMB" && profile.csemLevelAltitudeAglFt !== 0 ? profile.csemLevelAltitudeAglFt ?? OFFSET_CSEM_LEVEL_ALTITUDE_AGL_FT : undefined,
+    // The Level SEM turn (BDP v0.4.3; absent: no turn, Recovery G, the level-off speed). Direction absent: this
+    // aircraft's Roll-in direction (owner 2026-10-19).
+    semTurnType: profile.semTurnType ?? undefined,
+    // Absent: the Level SEM turns to the reciprocal of the Run-In heading (owner 2026-11-03).
+    semTurnDeg: profile.semTurnDeg ?? semTurnToRunInReciprocalDeg(runInHeadingDeg, attackHeadingDeg, profile.semTurnDirection ?? rollDirection),
+    semTurnDirection: profile.semTurnDirection ?? rollDirection ?? undefined,
+    semTurnG: profile.semTurnG ?? undefined,
+    semTurnSpeedKcas: profile.semTurnSpeedKcas ?? undefined,
+    semTurnBankDeg: profile.semTurnBankDeg ?? undefined,
+    // BDP v0.4 Roll-in onset rates (absent: the BDP defaults).
+    ...Object.fromEntries(["rollInRollRateDegSec", "rollOutRollRateDegSec", "gOnsetRateGSec"].filter((key) => profile[key] !== undefined && profile[key] !== null).map((key) => [key, finite(key, profile[key])])),
+    ballisticModelId: profile.ballisticModelId,
+    // POP-UP Roll-in option (0.1.11, BDP v0.4.5): only when the profile has it.
+    ...(profile.rollInStartFpaDeg === undefined ? {} : { rollInStartFpaDeg: finite("rollInStartFpaDeg", profile.rollInStartFpaDeg) }),
+    ...(profile.rollInSpeedModel === undefined ? {} : { rollInSpeedModel: profile.rollInSpeedModel }),
+  };
+}
+
+function attackHeadingFromOffsetAndAngleOff(runInHeadingDeg, offsetAngleDeg, angleOffDeg, direction) {
+  const offsetHeadingDeg = offsetHeadingFromOffset(runInHeadingDeg, offsetAngleDeg, direction);
+  return norm(direction.rollDirection === "RIGHT" ? offsetHeadingDeg + angleOffDeg : offsetHeadingDeg - angleOffDeg);
+}
+
+function resolveHeadingForOffset({ input, locks, driver, direction, runInHeadingDeg, offsetAngleDeg }) {
+  const inputAttackHeadingDeg = norm(finite("attackHeadingDeg", input.attackHeadingDeg));
+  const inputAngleOffDeg = Math.abs(finite("angleOffDeg", input.angleOffDeg));
+  const holdAngleOff = !!locks.angleOffDeg || (!locks.attackHeadingDeg && driver === "angleOffDeg");
+  if (holdAngleOff && !locks.attackHeadingDeg) {
+    const attackHeadingDeg = attackHeadingFromOffsetAndAngleOff(runInHeadingDeg, offsetAngleDeg, inputAngleOffDeg, direction);
+    return { attackHeadingDeg, angleOffDeg: inputAngleOffDeg };
+  }
+  const attackHeadingDeg = inputAttackHeadingDeg;
+  const offsetHeadingDeg = offsetHeadingFromOffset(runInHeadingDeg, offsetAngleDeg, direction);
+  return { attackHeadingDeg, angleOffDeg: angleOffFromOffsetHeading(offsetHeadingDeg, attackHeadingDeg, direction) };
+}
+
+// Mirrors offset-geometry-v0.2.mjs's buildOffsetCandidate, but the Run-In line is anchored at
+// `ipPoint` (which may be off the Target axis) instead of being forced through Target. Roll-in
+// Start / Track Point / Attack Track are derived exactly as in the single-aircraft model (they
+// depend only on offsetHeadingDeg and the BDP profile, never on IP position) — the only real
+// change is which point the Run-In line's line-intersection is anchored at.
+export function buildOffAxisOffsetCandidate(input) {
+  const { attackHeadingDeg, offsetAngleDeg, offsetRadiusNm, profile } = input;
+  const runInHeadingDeg = norm(finite("runInHeadingDeg", input.runInHeadingDeg));
+  const ipPoint = finitePoint("ipPoint", input.ipPoint);
+  [
+    ["attackHeadingDeg", attackHeadingDeg], ["offsetAngleDeg", offsetAngleDeg], ["offsetRadiusNm", offsetRadiusNm],
+  ].forEach(([name, value]) => finite(name, value));
+  if (!(offsetAngleDeg > 0 && offsetAngleDeg < 179.5)) throw new RangeError("Offset Angle must be > 0 and < 179.5 deg");
+  if (!(offsetRadiusNm > 0)) throw new RangeError("Offset Radius must be > 0 NM");
+  if (!profile?.public || !profile?.diagnostics || !profile?.visualization) throw new TypeError("profile must be a BDP semantic result");
+
+  const direction = directionRule(runInHeadingDeg, attackHeadingDeg);
+  if (direction.ambiguous) throw new Error("Run-In / Attack relation is directionally ambiguous");
+  const offsetHeadingDeg = offsetHeadingFromOffset(runInHeadingDeg, offsetAngleDeg, direction);
+  const angleOffDeg = angleOffFromOffsetHeading(offsetHeadingDeg, attackHeadingDeg, direction);
+  if (!(angleOffDeg > 0 && angleOffDeg < 179.5)) throw new RangeError("Angle-Off is outside the supported range");
+
+  const targetLocal = { forward: profile.diagnostics.targetForwardNm, turnSide: profile.diagnostics.targetTurnSideNm };
+  const targetVector = transformLocal(targetLocal, offsetHeadingDeg, direction.rollDirection);
+  const rollStart = mul(targetVector, -1);
+  const rollDisplacementGlobal = transformLocal({
+    forward: profile.public.rollInDisplacement.forwardNm,
+    turnSide: profile.public.rollInDisplacement.turnSideNm,
+  }, offsetHeadingDeg, direction.rollDirection);
+  const trackPoint = add(rollStart, rollDisplacementGlobal);
+  const offsetVector = vecHeading(offsetHeadingDeg);
+  const runVector = vecHeading(runInHeadingDeg);
+
+  const temporaryActionPoint = lineIntersection(ipPoint, mul(runVector, -1), rollStart, offsetVector);
+  if (!temporaryActionPoint) throw new Error("Run-In and Offset lines are parallel");
+
+  const offsetTurn = input.offsetTurn ?? null;
+  const placed = placeOffsetTurn({ temporaryActionPoint, runVector, offsetVector, direction, offsetRadiusNm, offsetAngleDeg, offsetTurn });
+  const { turnRadiusCorrectionNm, turnExitDistanceNm, realActionPoint, turnEnd, offsetCenter, offsetHoldStart, offsetHoldEnd } = placed;
+  // IP-referenced Action Range: distance from the follower's own IP to its Action Point along
+  // the Run-In direction. Replaces the single-aircraft Target-referenced Action Range, which has
+  // no meaning once the Run-In line no longer passes through Target.
+  const actionRangeFromIpNm = dot(sub(realActionPoint, ipPoint), runVector);
+  // Target-referenced Action Range (2026-09-26): horizontal Target -> Action Point distance, the
+  // follower's displayed/entered Action Range, same meaning as the lead's actionRangeNm.
+  const actionRangeNm = Math.hypot(realActionPoint.x, realActionPoint.y);
+  const approachRangeNm = dot(sub(rollStart, turnEnd), offsetVector);
+
+  // Roll-in Radius (owner 2026-11-10): the real turn radius at the tightest point of the Roll-in, with that
+  // point and its center of curvature (BDP visualization.rollInTurnRadius), in place of Radius (EFF).
+  const rollInTurnRadiusNm = profile.public.rollInTurnRadiusNm;
+  const turnRadiusLocal = profile.visualization.rollInTurnRadius;
+  const placeLocal = (q) => add(rollStart, transformLocal({ forward: q.forwardNm, turnSide: q.turnSideNm }, offsetHeadingDeg, direction.rollDirection));
+  const rollTurnPoint = Number.isFinite(rollInTurnRadiusNm) && turnRadiusLocal ? placeLocal(turnRadiusLocal.point) : null;
+  const rollCenter = rollTurnPoint ? placeLocal(turnRadiusLocal.center) : null;
+
+  const rollInTrajectorySamples = profile.visualization.rollInTrajectorySamples.map((sample) => {
+    const transformed = transformLocal({ forward: sample.forwardNm, turnSide: sample.turnSideNm }, offsetHeadingDeg, direction.rollDirection);
+    return add(rollStart, transformed);
+  });
+
+  const target = { x: 0, y: 0 };
+
+  return {
+    runInHeadingDeg,
+    attackHeadingDeg,
+    offsetHeadingDeg,
+    offsetAngleDeg,
+    angleOffDeg,
+    direction,
+    turnRadiusCorrectionNm,
+    turnExitDistanceNm,
+    actionRangeNm,
+    actionRangeFromIpNm,
+    approachRangeNm,
+    rollInRangeNm: profile.public.rollInRangeNm,
+    rollInTurnRadiusNm,
+    groundRangeNm: profile.public.groundRangeNm,
+    points: { target, ip: ipPoint, rollStart, trackPoint, temporaryActionPoint, realActionPoint, turnEnd, offsetCenter, offsetHoldStart, offsetHoldEnd, rollCenter, rollTurnPoint },
+    vectors: { runVector, offsetVector },
+    offsetTurn,
+    offsetTurnPath: placed.offsetTurnPath,
+    rollInTrajectorySamples,
+    profile,
+  };
+}
+
+export function validateOffAxisOffsetCandidate(candidate) {
+  const errors = [];
+  const warnings = [];
+  if (candidate.approachRangeNm < 0) errors.push("Offset Turn End has passed Roll-in Start");
+  else if (candidate.approachRangeNm < 0.25) warnings.push("Approach Range is very short");
+  if (candidate.offsetAngleDeg >= 120) warnings.push("Offset Angle is 120 deg or greater");
+  if (candidate.actionRangeFromIpNm < -0.001) errors.push("Action Point must not be behind this aircraft's own IP");
+  return { errors, warnings };
+}
+
+// Composes buildOffAxisOffsetCandidate with BDP and the offset turn, mirroring
+// offset-be-v0.2.mjs's calculateOffsetV0_2 result shape (resolved/timing/geometry/profile) so
+// existing single-aircraft FE rendering (Top View, drop-order deltas, field sync) can consume
+// either result interchangeably.
+// Public entrypoint: output truncated to 5 decimals (docs/FE-BE-RULES.md); the Full variant keeps
+// full precision for composition.
+export function calculateOffAxisOffset(input) {
+  return truncateBeOutput(calculateOffAxisOffsetFull(input));
+}
+
+export function calculateOffAxisOffsetFull(input) {
+  if (!input || typeof input !== "object") throw new TypeError("input must be an object");
+  const locks = input.locks ?? {};
+  const errors = [];
+  const warnings = [];
+  const runInHeadingDeg = norm(finite("runInHeadingDeg", input.runInHeadingDeg));
+  const ipPoint = finitePoint("ipPoint", input.ipPoint);
+  const enteredAttackHeadingDeg = finite("attackHeadingDeg", input.attackHeadingDeg);
+  const enteredAngleOffDeg = Math.abs(finite("angleOffDeg", input.angleOffDeg));
+  const driver = input.driver ?? "angleOffDeg";
+  // Attack Heading vs Angle-Off hold: the driver unless the caller names the last heading edit apart
+  // from a range / Offset Angle driver (a follower holding its Action Range keeps an Angle-Off edit).
+  const headingDriver = input.headingDriver ?? driver;
+  const direction = directionRule(runInHeadingDeg, enteredAttackHeadingDeg);
+  if (direction.ambiguous) throw new Error("Run-In / Attack relation is directionally ambiguous");
+
+  const turn = resolveOffsetTurn(input, locks, input.turnDriver ?? "offsetG");
+  errors.push(...turn.errors);
+  warnings.push(...turn.warnings);
+
+  const evaluate = (offsetAngleDeg) => {
+    const headings = resolveHeadingForOffset({ input, locks, driver: headingDriver, direction, runInHeadingDeg, offsetAngleDeg });
+    if (!(headings.angleOffDeg > 0 && headings.angleOffDeg < 179.5)) throw new Error("Angle-Off outside supported range");
+    const derivedDirection = directionRule(runInHeadingDeg, headings.attackHeadingDeg);
+    if (derivedDirection.ambiguous || derivedDirection.attackSide !== direction.attackSide) throw new Error("Heading solve would switch the fixed Offset/Roll-in side");
+    const profile = calculateBombDeliveryV0_4(canonicalProfileInput(input, headings.angleOffDeg, headings.attackHeadingDeg, direction.rollDirection, runInHeadingDeg));
+    return buildOffAxisOffsetCandidate({
+      runInHeadingDeg,
+      ipPoint,
+      attackHeadingDeg: headings.attackHeadingDeg,
+      offsetAngleDeg,
+      offsetRadiusNm: turn.offsetRadiusNm,
+      offsetTurn: offsetOnsetTurn(input, turn, offsetAngleDeg),
+      profile,
+    });
+  };
+
+  let initialOffsetAngleDeg;
+  if (locks.offsetAngleDeg || driver === "offsetAngleDeg") initialOffsetAngleDeg = Math.abs(finite("offsetAngleDeg", input.offsetAngleDeg));
+  else initialOffsetAngleDeg = offsetAngleFromAngleOff(runInHeadingDeg, enteredAttackHeadingDeg, enteredAngleOffDeg, direction);
+
+  // Range constraint: `actionRangeNm` is the Target-referenced Action Range (the follower's own
+  // field); `actionRangeFromIpNm` (IP-referenced) remains for the Same-Time solve, whose time
+  // metric is linear in it; `approachRangeNm` (Offset Turn End -> Roll-in Start) as on #1, after an
+  // Action Range LOCK. A LOCK outranks the driver.
+  const RANGE_KEYS = ["actionRangeFromIpNm", "actionRangeNm", "approachRangeNm"];
+  const rangeKey = RANGE_KEYS.find((key) => locks[key]) ?? (RANGE_KEYS.includes(driver) ? driver : null);
+  const rangeFixed = rangeKey !== null;
+  const rangeLabel = rangeKey === "approachRangeNm" ? "Approach Range" : "Action Range";
+  const rangeTargetNm = rangeFixed ? finite(rangeKey, input[rangeKey]) : null;
+  const offsetCanVary = !locks.offsetAngleDeg && driver !== "offsetAngleDeg" && !(locks.attackHeadingDeg && locks.angleOffDeg);
+  let candidate = null;
+  let residualNm = null;
+  let exact = true;
+
+  if (rangeFixed && offsetCanVary) {
+    const maxAngle = offsetAngleScanMaxDeg({ locks, driver: headingDriver, direction });
+    const solved = solveOffsetAngleForActionRange({
+      targetRangeNm: rangeTargetNm,
+      evaluate: (angle) => {
+        const built = evaluate(angle);
+        return { built, actionRangeNm: built[rangeKey] };
+      },
+      maxOffsetAngleDeg: maxAngle,
+      toleranceNm: 0.002,
+    });
+    candidate = solved.candidate?.built ?? null;
+    residualNm = solved.residualNm;
+    exact = solved.exact;
+    if (!candidate) throw new Error(`No valid Offset Angle candidate for the requested ${rangeLabel}${solved.failureCause ? ` (cause: ${solved.failureCause})` : ""}`);
+    if (!exact) warnings.push(`${rangeLabel} root is best-effort; residual ${Number(residualNm).toFixed(3)} NM`);
+  } else {
+    candidate = evaluate(initialOffsetAngleDeg);
+    if (rangeFixed) {
+      residualNm = candidate[rangeKey] - rangeTargetNm;
+      exact = Math.abs(residualNm) <= 0.002;
+      if (!exact) errors.push(`CONSTRAINT CONFLICT: ${rangeLabel} residual ${residualNm.toFixed(3)} NM`);
+    }
+  }
+  if (!candidate) throw new Error("Offset geometry was not produced");
+
+  if (locks.attackHeadingDeg && !near(norm(input.attackHeadingDeg), norm(candidate.attackHeadingDeg), 0.02)) errors.push("LOCK conflict: Attack Heading cannot be satisfied");
+  if (locks.angleOffDeg && !near(Math.abs(input.angleOffDeg), candidate.angleOffDeg, 0.02)) errors.push("LOCK conflict: Angle-Off cannot be satisfied");
+  if (locks.offsetAngleDeg && !near(Math.abs(input.offsetAngleDeg), candidate.offsetAngleDeg, 0.02)) errors.push("LOCK conflict: Offset Angle cannot be satisfied");
+  if (locks.actionRangeFromIpNm && !near(input.actionRangeFromIpNm, candidate.actionRangeFromIpNm, 0.002)) errors.push("LOCK conflict: Action Range cannot be satisfied");
+  if (locks.actionRangeNm && !near(input.actionRangeNm, candidate.actionRangeNm, 0.002)) errors.push("LOCK conflict: Action Range cannot be satisfied");
+  if (locks.approachRangeNm && !near(input.approachRangeNm, candidate.approachRangeNm, 0.002)) errors.push("LOCK conflict: Approach Range cannot be satisfied");
+
+  const candidateValidation = validateOffAxisOffsetCandidate(candidate);
+  errors.push(...candidateValidation.errors);
+  warnings.push(...candidateValidation.warnings);
+  // IP limit (user rule, 2026-09-27): a follower's Action Point must not lie farther out along the
+  // Run-In than the Flight's IP (#1's IP, VRP + 3 NM when linked), i.e. below that IP in the IP Bottom
+  // Top View. Optional input; the geometry is still returned (INVALID) so it can be drawn.
+  let ipLimit = null;
+  if (input.ipLimitPoint !== undefined && input.ipLimitPoint !== null) {
+    const limit = finitePoint("ipLimitPoint", input.ipLimitPoint);
+    const runVector = candidate.vectors.runVector;
+    const limitRunRangeNm = -dot(limit, runVector);
+    const actionPointRunRangeNm = -dot(candidate.points.realActionPoint, runVector);
+    const violated = actionPointRunRangeNm > limitRunRangeNm + 0.001;
+    ipLimit = { point: { ...limit }, limitRunRangeNm, actionPointRunRangeNm, violated };
+    if (violated) errors.push(`Action Point must not be below the Flight IP (${actionPointRunRangeNm.toFixed(1)} NM out along the Run-In, IP ${limitRunRangeNm.toFixed(1)} NM)`);
+  }
+
+  const speedFps = turn.offsetTasKt * KT_TO_FPS;
+  // Signed IP -> Action leg (negative when the Action Point is behind this aircraft's own IP):
+  // that geometry is INVALID but keeps its real timing, so drop-order deltas stay consistent.
+  // `signedIngressSec` is kept as an alias for existing time-matching callers.
+  const ingressDistanceNm = candidate.actionRangeFromIpNm;
+  const ingressSec = (ingressDistanceNm * FT_PER_NM) / speedFps;
+  const signedIngressSec = ingressSec;
+  const turnSec = candidate.offsetTurn.timeSec;
+  const approachRangeNm = candidate.approachRangeNm;
+  const approachSec = (Math.max(0, approachRangeNm) * FT_PER_NM) / speedFps;
+  const rollToReleaseSec = candidate.profile.public.rollInTimeSec + candidate.profile.public.trackingTimeSec;
+  const offsetIpToReleaseSec = ingressSec + turnSec + approachSec + rollToReleaseSec;
+  const nonFinite = nonFiniteResultFields({ actionRangeNm: candidate.actionRangeNm, actionRangeFromIpNm: candidate.actionRangeFromIpNm, approachRangeNm, ingressSec, turnSec, approachSec, rollToReleaseSec, offsetIpToReleaseSec, rollStartX: candidate.points.rollStart.x, rollStartY: candidate.points.rollStart.y });
+  if (nonFinite.length) errors.push(`Offset result is not finite (${nonFinite.join(", ")})`);
+
+  return {
+    model: { ...OFFSET_FORMATION_GEOMETRY_V0_1 },
+    state: errors.length ? "INVALID" : warnings.length ? "WARNING" : "VALID",
+    errors,
+    warnings,
+    locks: { ...locks },
+    driver,
+    turnDriver: input.turnDriver ?? "offsetG",
+    resolved: {
+      runInHeadingDeg,
+      attackHeadingDeg: candidate.attackHeadingDeg,
+      angleOffDeg: candidate.angleOffDeg,
+      offsetAngleDeg: candidate.offsetAngleDeg,
+      offsetHeadingDeg: candidate.offsetHeadingDeg,
+      actionRangeNm: candidate.actionRangeNm,
+      actionRangeFromIpNm: candidate.actionRangeFromIpNm,
+      // This aircraft's own IP distance from Target (its IP is off the Target-through axis).
+      ipRangeNm: Math.hypot(ipPoint.x, ipPoint.y),
+      approachRangeNm,
+      offsetAltitudeMslFt: input.offsetAltitudeMslFt,
+      offsetSpeedValue: input.offsetSpeedValue,
+      offsetSpeedMode: input.offsetSpeedMode ?? "CAS",
+      offsetG: turn.offsetG,
+      offsetBankDeg: turn.offsetBankDeg,
+      offsetRadiusNm: turn.offsetRadiusNm,
+      offsetTasKt: turn.offsetTasKt,
+    },
+    timing: {
+      ingressDistanceNm,
+      ingressSec,
+      signedIngressSec,
+      offsetTurnSec: turnSec,
+      approachSec,
+      rollToReleaseSec,
+      offsetIpToReleaseSec,
+    },
+    geometry: candidate,
+    profile: candidate.profile,
+    ipLimit,
+    solve: { residualNm, exact },
+  };
+}
