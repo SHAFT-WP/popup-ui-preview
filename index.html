@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>POP-UP Tactics · V2 WORK</title>
-<link rel="stylesheet" href="./offset.css?v=8198ede430a4">
-  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=8198ede430a4">
-<link rel="stylesheet" href="./wide-layout.css?v=8198ede430a4">
+<link rel="stylesheet" href="./offset.css?v=0188039e6381">
+  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=0188039e6381">
+<link rel="stylesheet" href="./wide-layout.css?v=0188039e6381">
 </head>
 <!-- POP-UP page (owner 2026-10-27, POP-UP SPEC §13.1: the Offset taken as is and modified). The Offset index
      markup with the POP-UP input group and Result group; the Offset controller runs in POP-UP mode (body.popup-page):
@@ -90,6 +90,8 @@
       <div class="input-grid">
         <label class="field speed-field"><span>Initial Speed</span><span class="compound"><input data-key="offsetSpeedValue" type="text" inputmode="decimal" value="350"><select data-key="offsetSpeedMode" aria-label="Initial Speed unit"><option value="CAS" selected>kcas</option><option value="MACH">Mach</option></select></span><span class="unit">IP → Offset Turn → Pop Point speed · same value as Offset Turn Speed</span></label>
         <label class="field"><span class="lock-title"><span>Initial Altitude (ft MSL)</span><button id="initial-link-btn" class="lock-button" type="button" aria-label="Link Initial Altitude to Roll-in Altitude" aria-pressed="false">LINK</button></span><input data-key="initialAltitudeMslFt" type="text" inputmode="decimal" value="500"><span class="unit" data-initial-link-note>Reference only (not linked)</span></label>
+        <!-- Owner 2026-11-16: the Apex (result) after the Initial Altitude; the same readout as the POP-UP group's. -->
+        <div class="field"><span>Apex (ft MSL)</span><output class="readout" data-popup-apex-out>-</output><span class="unit">Top of the climb · result</span></div>
         <label class="field"><span class="lock-title"><span>Dive Angle (deg)</span><button class="lock-button" type="button" data-lock-key="diveAngleDeg" aria-pressed="false">LOCK</button></span><input data-key="diveAngleDeg" type="text" inputmode="decimal" value="45"><span class="unit">BDP / Offset parameter</span></label>
         <label class="field"><span>Tracking Time (sec)</span><input data-key="trackingTimeSec" type="text" inputmode="decimal" value="18.0"><span class="unit">Track Point → Release · 0.1 s</span></label>
         <label class="field"><span>Release Altitude (ft MSL)</span><input data-key="releaseAltitudeMslFt" type="text" inputmode="decimal" value="6800"><span class="unit">NLT clamp is BDP-owned</span></label><label class="field"><span>NLT Release (ft MSL)</span><output class="readout" data-bdp-nlt-release>-</output><span class="unit">Result · BDP minimum release altitude</span></label>
@@ -285,7 +287,7 @@
 
   <div id="flight-followers"></div>
 </main>
-<script type="module" src="./wide-layout.mjs?v=8198ede430a4"></script>
+<script type="module" src="./wide-layout.mjs?v=0188039e6381"></script>
 
 </body>
 </html>
