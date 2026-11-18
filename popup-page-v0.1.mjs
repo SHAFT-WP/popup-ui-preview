@@ -5,10 +5,12 @@
 import { formatG } from "./common/ui/display-precision-v0.1.mjs?v=0.1.1";
 import { POPUP_Z_DIAGRAM_V0_1 } from "./AG/bombing/popup/view/popup-z-diagram-v0.1.mjs?v=0.1.6";
 
-export const POPUP_PAGE_V0_1 = Object.freeze({ id: "popup-page-v0.1", version: "0.1.0" });
+export const POPUP_PAGE_V0_1 = Object.freeze({ id: "popup-page-v0.1", version: "0.1.3" });
+// 0.1.1 (owner 2026-11-17, "기본값은 4G"): the default Popup G is 4 G (was 3 G).
+// 0.1.2 (owner 2026-11-18, "더 직관적으로"): the Hold-Down row is two rows, Offset-Popup Range (NM) and Offset-Popup Time (s).
 
 // POP-UP defaults (step 3b): a low-level ingress (Offset leg 500 ft / 480 KCAS), Roll-in Altitude 4,000 ft at
-// 400 KCAS, Dive 20°, Roll-in G 3, Popup G 3 (POP-UP SPEC §13.2c); the Popup angle from the automatic rule.
+// 400 KCAS, Dive 20°, Roll-in G 3, Popup G 4 (owner 2026-11-17; was 3, POP-UP SPEC §13.2c); the Popup angle from the automatic rule.
 export const POPUP_DEFAULT_INPUT_VALUES = Object.freeze({
   offsetAltitudeMslFt: "500",
   offsetSpeedValue: "480",
@@ -20,7 +22,9 @@ export const POPUP_DEFAULT_INPUT_VALUES = Object.freeze({
   trackingTimeSec: "5.0",
   rollInG: "3",
   vrpRangeNm: "8.0",
-  popupG: "3",
+  // Owner 2026-11-18 ("Offset 기본값 3G"): the POP-UP Offset turn at 3 G (the Offset page keeps 2 G).
+  offsetG: "3.0",
+  popupG: "4",
   popupAngleDeg: "",
   popupGroundDistanceNm: "",
   popupExposureTimeSec: "",
@@ -77,7 +81,9 @@ export function popupResultRows(p, row, { keyed = true } = {}) {
     r("Popup Angle", `${one(p.popupAngleDeg)}° · ${POPUP_DRIVER_TEXT[p.driver] ?? p.driver}`, "popupAngleDeg", true),
     r("Pop to Roll-in Distance", `${Number.isFinite(p.groundDistanceNm) ? p.groundDistanceNm.toFixed(2) : "-"} NM`, "popupGroundDistanceNm", true),
     r("Exposure (Pop → Apex)", `${one(p.exposureTimeSec)} s`, "popupExposureTimeSec", true),
-    r("Hold-Down", `${Number.isFinite(p.holdDownNm) ? p.holdDownNm.toFixed(2) : "-"} NM${Number.isFinite(p.holdDownSec) ? ` / ${one(p.holdDownSec)} s` : ""}`, "popupHoldDownNm", true),
+    // Offset-Popup Range / Time (owner 2026-11-18, "더 직관적으로"; was the one Hold-Down row): Offset Turn End → Pop.
+    r("Offset-Popup Range", `${Number.isFinite(p.holdDownNm) ? p.holdDownNm.toFixed(2) : "-"} NM`, "popupOffsetPopupRange", true),
+    r("Offset-Popup Time", `${Number.isFinite(p.holdDownSec) ? one(p.holdDownSec) : "-"} s`, "popupOffsetPopupTime", true),
     // At the Pop Point (owner 2026-11-01): range and angle-off to the Target, and the time after IP.
     // Pop-up Range (owner 2026-11-02): the Pop-up Point → Target distance.
     r("Pop-up Range", `${Number.isFinite(p.popToTargetNm) ? p.popToTargetNm.toFixed(2) : "-"} NM`, "popupRange", true),

@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>POP-UP Tactics · V2 WORK</title>
-<link rel="stylesheet" href="./offset.css?v=e4f45d6042a5">
-  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=e4f45d6042a5">
-<link rel="stylesheet" href="./wide-layout.css?v=e4f45d6042a5">
+<link rel="stylesheet" href="./offset.css?v=d9d5e4a1edc2">
+  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=d9d5e4a1edc2">
+<link rel="stylesheet" href="./wide-layout.css?v=d9d5e4a1edc2">
+<link rel="stylesheet" href="./popup-design-graph-v0.1.css?v=0.1.1">
 </head>
 <!-- POP-UP page (owner 2026-10-27, POP-UP SPEC §13.1: the Offset taken as is and modified). The Offset index
      markup with the POP-UP input group and Result group; the Offset controller runs in POP-UP mode (body.popup-page):
@@ -126,7 +127,7 @@
         <label class="field"><span>Pop-up Speed (kcas)</span><input data-key="popupSpeedKcas" type="text" inputmode="decimal" value=""><span class="unit" data-popup-speed-note>Follows Initial Speed · type to set</span></label>
         <div class="field"><span>Pop-up Range (NM)</span><output id="popup-range-out" class="readout">-</output><span class="unit">Pop-up Point → Target · result</span></div>
         <label class="field"><span class="lock-title"><span>Popup Angle (deg)</span><button class="lock-button" type="button" data-popup-lock="angle" aria-label="Lock Popup Angle" aria-pressed="false">LOCK</button></span><input data-key="popupAngleDeg" type="text" inputmode="decimal" value=""><span class="unit">Climb angle · 0–55°</span></label>
-        <label class="field"><span>Popup G (G)</span><input data-key="popupG" type="text" inputmode="decimal" value="3"><span class="unit">Pull-up G · BDP G onset rate</span></label>
+        <label class="field"><span>Popup G (G)</span><input data-key="popupG" type="text" inputmode="decimal" value="4"><span class="unit">Pull-up G · BDP G onset rate</span></label>
         <label class="field speed-field"><span class="lock-title"><span>Roll-in Speed (kcas)</span><button class="lock-button" type="button" data-popup-lock="rollInSpeed" aria-label="Lock Roll-in Speed" aria-pressed="false">LOCK</button></span><input data-key="initialSpeedValue" type="text" inputmode="decimal" value="350"><select data-key="initialSpeedMode" hidden><option value="CAS" selected>kcas</option></select><span class="unit">AUTO · MIL arrival at Roll-in Start · result</span></label>
         <label class="field"><span class="lock-title"><span>Roll-in Altitude (ft MSL)</span><button class="lock-button" type="button" data-lock-key="rollInAltitudeMslFt" aria-label="Lock Roll-in Altitude" aria-pressed="false">LOCK</button></span><input data-key="rollInAltitudeMslFt" type="text" inputmode="decimal" value="16000"><span class="unit">OA1 / BDP entry altitude · LOCK: Tracking Time → Release Alt</span></label>
         <div class="field"><span>Apex (ft MSL)</span><output id="popup-apex-out" class="readout">-</output><span class="unit">Top of the climb · result</span></div>
@@ -143,7 +144,7 @@
       <div class="input-grid">
         <label class="field"><span class="lock-title"><span>Altitude (ft MSL)</span><button class="lock-button" type="button" data-lock-key="offsetAltitudeMslFt" aria-pressed="false">LOCK</button></span><input data-key="offsetAltitudeMslFt" type="text" inputmode="decimal" value="16000"></label>
         <label class="field speed-field"><span class="lock-title"><span>Speed</span><button class="lock-button" type="button" data-lock-key="offsetSpeedValue" aria-pressed="false">LOCK</button></span><span class="compound"><input data-key="offsetSpeedValue" type="text" inputmode="decimal" value="350"><select data-key="offsetSpeedMode"><option value="CAS" selected>kcas</option><option value="MACH">Mach</option></select></span></label>
-        <label class="field"><span class="lock-title"><span>G</span><button class="lock-button" type="button" data-lock-key="offsetG" aria-pressed="false">LOCK</button></span><input data-key="offsetG" type="text" inputmode="decimal" value="2.0"></label>
+        <label class="field"><span class="lock-title"><span>G</span><button class="lock-button" type="button" data-lock-key="offsetG" aria-pressed="false">LOCK</button></span><input data-key="offsetG" type="text" inputmode="decimal" value="3.0"></label>
         <label class="field"><span class="lock-title"><span>Bank (deg)</span><button class="lock-button" type="button" data-lock-key="offsetBankDeg" aria-pressed="false">LOCK</button></span><input data-key="offsetBankDeg" type="text" inputmode="decimal" value="60"></label>
         <label class="field"><span class="lock-title"><span>Radius (NM)</span><button class="lock-button" type="button" data-lock-key="offsetRadiusNm" aria-pressed="false">LOCK</button></span><input data-key="offsetRadiusNm" type="text" inputmode="decimal" value="1.6"></label>
         <div class="field"><span>Turn Time</span><output id="turn-time-out" class="readout">-</output><span class="unit">Actual TAS / Radius / Offset Angle</span></div>
@@ -287,7 +288,7 @@
 
   <div id="flight-followers"></div>
 </main>
-<script type="module" src="./wide-layout.mjs?v=e4f45d6042a5"></script>
+<script type="module" src="./wide-layout.mjs?v=d9d5e4a1edc2"></script>
 
 </body>
 </html>
