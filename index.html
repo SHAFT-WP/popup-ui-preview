@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>POP-UP Tactics · V2 WORK</title>
-<link rel="stylesheet" href="./offset.css?v=8fea63f1ff5c">
-  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=8fea63f1ff5c">
-<link rel="stylesheet" href="./wide-layout.css?v=8fea63f1ff5c">
+<link rel="stylesheet" href="./offset.css?v=9554f923c7c3">
+  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=9554f923c7c3">
+<link rel="stylesheet" href="./wide-layout.css?v=9554f923c7c3">
 <link rel="stylesheet" href="./popup-design-graph-v0.1.css?v=0.1.1">
 </head>
 <!-- POP-UP page (owner 2026-10-27, POP-UP SPEC §13.1: the Offset taken as is and modified). The Offset index
@@ -189,6 +189,9 @@
     </div>
     <output id="save-status" class="status-message valid" role="status">-</output>
     <p class="flight-draft-note" id="preset-status">Default: built-in</p>
+    <!-- BMS Mission (DTC) and DTE as on the Offset page (owner 2026-11-19, plan S10; bms-mission-panel-v0.1.mjs, mounted by
+         wide-layout.mjs with tool "popup": the DTE also writes VRPPUP / VIPPUP and OA2). -->
+    <div class="bms-mission" id="bms-mission"></div>
   </section>
 
 
@@ -289,7 +292,7 @@
 
   <div id="flight-followers"></div>
 </main>
-<script type="module" src="./wide-layout.mjs?v=8fea63f1ff5c"></script>
+<script type="module" src="./wide-layout.mjs?v=9554f923c7c3"></script>
 
 </body>
 </html>
