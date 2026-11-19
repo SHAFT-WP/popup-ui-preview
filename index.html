@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>POP-UP Tactics · V2 WORK</title>
-<link rel="stylesheet" href="./offset.css?v=84f657a83f48">
-  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=84f657a83f48">
-<link rel="stylesheet" href="./wide-layout.css?v=84f657a83f48">
+<link rel="stylesheet" href="./offset.css?v=2961b329b9b0">
+  <link rel="stylesheet" href="./common/ui/result-panel-v0.1.css?v=2961b329b9b0">
+<link rel="stylesheet" href="./wide-layout.css?v=2961b329b9b0">
 <link rel="stylesheet" href="./popup-design-graph-v0.1.css?v=0.1.1">
 </head>
 <!-- POP-UP page (owner 2026-10-27, POP-UP SPEC §13.1: the Offset taken as is and modified). The Offset index
@@ -96,7 +96,7 @@
         <label class="field"><span class="lock-title"><span>Dive Angle (deg)</span><button class="lock-button" type="button" data-lock-key="diveAngleDeg" aria-pressed="false">LOCK</button></span><input data-key="diveAngleDeg" type="text" inputmode="decimal" value="45"><span class="unit">BDP / Offset parameter</span></label>
         <label class="field"><span>Tracking Time (sec)</span><input data-key="trackingTimeSec" type="text" inputmode="decimal" value="18.0"><span class="unit">Track Point → Release · 0.1 s</span></label>
         <label class="field"><span>Release Altitude (ft MSL)</span><input data-key="releaseAltitudeMslFt" type="text" inputmode="decimal" value="6800"><span class="unit">NLT clamp is BDP-owned</span></label><label class="field"><span>NLT Release (ft MSL)</span><output class="readout" data-bdp-nlt-release>-</output><span class="unit">Result · BDP minimum release altitude</span></label>
-        <label class="field"><span>Release Speed (kcas)</span><input data-key="releaseSpeedKcas" type="text" inputmode="decimal" value="450"><span class="unit">Release speed</span></label>
+        <label class="field"><span>Release Speed (kcas)</span><input data-key="releaseSpeedKcas" type="text" inputmode="decimal" value=""><span class="unit">MIL dive · Release speed · result</span></label>
         <div class="field"><span>MINALT (ft MSL)</span><output class="readout" data-bdp-min-alt>-</output><span class="unit">Result · BDP recovery bottom</span></div>
       </div>
     </details>
@@ -288,7 +288,7 @@
 
   <div id="flight-followers"></div>
 </main>
-<script type="module" src="./wide-layout.mjs?v=84f657a83f48"></script>
+<script type="module" src="./wide-layout.mjs?v=2961b329b9b0"></script>
 
 </body>
 </html>
